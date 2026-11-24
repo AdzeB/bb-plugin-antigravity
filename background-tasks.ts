@@ -134,15 +134,17 @@ function readTaskState(path: string, maxAgeMs: number): PersistedBackgroundTask[
 }
 
 /** Atomic-ish write: temp file + rename, so a crash mid-write can never corrupt the state file. */
-function writeTaskState(path: string, tasks: PersistedBackgroundTask[]): void {
+function writeTaskState(path: string, tasks: PersistedBackgroundTask[]): boolean {
   try {
     mkdirSync(dirname(path), { recursive: true });
     const temp = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
     writeFileSync(temp, `${JSON.stringify({ version: 1, tasks } satisfies PersistedBackgroundTaskStateFile)}\n`);
     renameSync(temp, path);
+    return true;
   } catch {
     // Best effort: persistence trouble (missing dir permissions, full disk, ...) must never
-    // crash the plugin host; the tracker simply continues in memory-only mode.
+    // crash the plugin host. Keep pending changes for the next save.
+    return false;
   }
 }
 
@@ -230,11 +232,28 @@ export function createBackgroundTaskTracker(options: {
     ...(task.transcriptPath ? { transcriptPath: task.transcriptPath } : {}),
     ...(task.outputFile ? { outputFile: task.outputFile } : {}),
   });
-  function persistState(thread: string) {
+  const recordKey = (record: PersistedBackgroundTask) => JSON.stringify([record.threadId, taskKey(record)]);
+  const pendingWrites = new Map<string, { record: PersistedBackgroundTask; remove: boolean }>();
+  function persistTasks(thread: string, tasks: BackgroundTask[], remove: boolean) {
     if (!persistPath) return;
-    const records = readTaskState(persistPath, maxAge).filter(record => record.threadId !== thread);
-    for (const task of threads.get(thread)?.values() ?? []) records.push(toRecord(thread, task));
-    writeTaskState(persistPath, records);
+    for (const task of tasks) {
+      const record = toRecord(thread, task);
+      const key = recordKey(record);
+      pendingWrites.set(JSON.stringify([key, record.startedAt, record.parentToolCallId]), { record, remove });
+      initialRecords.delete(key);
+    }
+    if (!pendingWrites.size) return;
+    const records = new Map(readTaskState(persistPath, maxAge).map(record => [recordKey(record), record]));
+    for (const change of pendingWrites.values()) {
+      const key = recordKey(change.record);
+      const existing = records.get(key);
+      if (change.remove) {
+        if (existing?.startedAt === change.record.startedAt && existing.parentToolCallId === change.record.parentToolCallId) records.delete(key);
+      } else if (!existing || existing.startedAt <= change.record.startedAt) {
+        records.set(key, change.record);
+      }
+    }
+    if (writeTaskState(persistPath, [...records.values()])) pendingWrites.clear();
   }
   /**
    * Restart reconciliation: `clearThread`-shaped `interrupted` closes for persisted tasks of a
@@ -245,13 +264,17 @@ export function createBackgroundTaskTracker(options: {
     if (!persistPath) return [];
     const records = readTaskState(persistPath, maxAge);
     const active = threads.get(thread);
-    const pending = records.filter(record => record.threadId === thread && !active?.has(taskKey(record)) && initialRecordKeys.has(`${record.threadId}\u0000${record.taskId}`));
+    const pending = records.filter(record => {
+      const initial = initialRecords.get(recordKey(record));
+      return record.threadId === thread && !active?.has(taskKey(record)) &&
+        initial?.startedAt === record.startedAt && initial.parentToolCallId === record.parentToolCallId;
+    });
     if (!pending.length) return [];
     const results = pending.map(record => delta({
       taskId: record.taskId, taskType: record.taskType, description: record.description, parentToolCallId: record.parentToolCallId,
       ...(record.transcriptPath ? { transcriptPath: record.transcriptPath } : {}), ...(record.outputFile ? { outputFile: record.outputFile } : {}),
     }, 'interrupted', 'stopped'));
-    persistState(thread);
+    persistTasks(thread, pending, true);
     return results;
   }
   function syncPolling() {
@@ -265,13 +288,14 @@ export function createBackgroundTaskTracker(options: {
   }
   function settle(thread: string, id: string, status: NonNullable<BackgroundTaskDelta['status']>, taskStatus: string, summary?: string, type?: BackgroundTask['taskType']) {
     const tasks = threads.get(thread);
+    const removed: BackgroundTask[] = [];
     const results: BackgroundTaskDelta[] = [];
     for (const [key, task] of tasks ?? []) {
-      if ((task.taskId === id || task.taskId.endsWith(`/${id}`) || id.endsWith(`/${task.taskId}`)) && (!type || task.taskType === type)) { tasks!.delete(key); results.push(delta(task, status, taskStatus, summary)); }
+      if ((task.taskId === id || task.taskId.endsWith(`/${id}`) || id.endsWith(`/${task.taskId}`)) && (!type || task.taskType === type)) { tasks!.delete(key); removed.push(task); results.push(delta(task, status, taskStatus, summary)); }
     }
     if (!tasks?.size) threads.delete(thread);
     syncPolling();
-    if (results.length) persistState(thread);
+    if (removed.length) persistTasks(thread, removed, true);
     return results;
   }
   function inspectTextForCompletions(thread: string, text: string): BackgroundTaskDelta[] {
@@ -372,7 +396,7 @@ export function createBackgroundTaskTracker(options: {
     const tasks = threads.get(thread) ?? new Map<string, BackgroundTask>();
     if (tasks.has(taskKey(task))) return results;
     tasks.set(taskKey(task), task); threads.set(thread, tasks);
-    persistState(thread);
+    persistTasks(thread, [task], false);
     if (task.transcriptPath && interval > 0) {
       const paths = watchers.get(thread) ?? new Map();
       if (!paths.has(task.transcriptPath)) {
@@ -387,19 +411,22 @@ export function createBackgroundTaskTracker(options: {
   }
   function getActiveTasks(thread: string): ReadonlyArray<BackgroundTask> { return [...(threads.get(thread)?.values() ?? [])].map(task => ({ ...task })); }
   function clearThread(thread: string, emitCloseDeltas = false): BackgroundTaskDelta[] {
-    const results = emitCloseDeltas ? getActiveTasks(thread).map(task => delta(task, 'interrupted', 'stopped')) : [];
+    const active = getActiveTasks(thread);
+    const results = emitCloseDeltas ? active.map(task => delta(task, 'interrupted', 'stopped')) : [];
     threads.delete(thread); threadTools.delete(thread); streamBuffers.delete(thread); silentTurns.delete(thread); syncPolling();
-    persistState(thread); return results;
+    const recovered = [...initialRecords.values()].filter(record => record.threadId === thread);
+    persistTasks(thread, [...recovered, ...active], true);
+    return results;
   }
   // Startup load: snapshot which records predate this host process (only those are eligible for
   // reconciliation) and flush a GC pass so records older than the max age cannot accumulate
   // across restarts, even if no traffic ever arrives. Persisted records are intentionally NOT
   // dropped on dispose(): a graceful host exit is indistinguishable from a crash here, and the
   // next resume must still report the tasks as interrupted.
-  const initialRecordKeys = new Set<string>();
+  const initialRecords = new Map<string, PersistedBackgroundTask>();
   if (persistPath) {
     const records = readTaskState(persistPath, maxAge);
-    for (const record of records) initialRecordKeys.add(`${record.threadId}\u0000${record.taskId}`);
+    for (const record of records) initialRecords.set(recordKey(record), record);
     writeTaskState(persistPath, records);
   }
   return {
