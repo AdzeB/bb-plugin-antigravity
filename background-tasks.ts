@@ -100,21 +100,6 @@ function mergeToolEvent(previous: RecordedToolEvent | undefined, event: Recorded
  */
 const DEFAULT_TASK_STATE_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
 
-/**
- * Stable per-host location for the persisted background-task state file.
- *
- * Why `~/.bb/plugin-data/bb-plugin-antigravity/background-tasks.json`:
- * - The plugin host process must be able to write it and it must survive host restarts, so a
- *   fixed per-user path beats anything under a thread workspace (which may not exist or be
- *   writable when the tracker starts, and is not unique per plugin host).
- * - Unlike an OS temp dir, which cleanup tools may wipe, the user's `.bb` area is persistent
- *   across reboots; namespacing it by plugin name avoids collisions with other BB plugins (the
- *   file itself is versioned for the same reason).
- * - Concurrent plugin hosts on the same machine share this one file; records are keyed by
- *   thread id and writes merge with the current on-disk state, so hosts never clobber each
- *   other's threads.
- * `BB_ANTIGRAVITY_TASK_STATE_DIR` overrides the directory; tests inject a temp path instead.
- */
 export function defaultBackgroundTaskStatePath(): string {
   const override = process.env.BB_ANTIGRAVITY_TASK_STATE_DIR?.trim();
   const dir = override || join(homedir(), '.bb', 'plugin-data', 'bb-plugin-antigravity');
@@ -149,17 +134,15 @@ function readTaskState(path: string, maxAgeMs: number): PersistedBackgroundTask[
 }
 
 /** Atomic-ish write: temp file + rename, so a crash mid-write can never corrupt the state file. */
-function writeTaskState(path: string, tasks: PersistedBackgroundTask[]): boolean {
+function writeTaskState(path: string, tasks: PersistedBackgroundTask[]): void {
   try {
     mkdirSync(dirname(path), { recursive: true });
     const temp = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
     writeFileSync(temp, `${JSON.stringify({ version: 1, tasks } satisfies PersistedBackgroundTaskStateFile)}\n`);
     renameSync(temp, path);
-    return true;
   } catch {
     // Best effort: persistence trouble (missing dir permissions, full disk, ...) must never
     // crash the plugin host; the tracker simply continues in memory-only mode.
-    return false;
   }
 }
 
@@ -180,9 +163,6 @@ export function createBackgroundTaskTracker(options: {
   const interval = options.pollIntervalMs ?? 500;
   const persistPath = options.persistPath || undefined;
   const maxAge = options.taskStateMaxAgeMs ?? DEFAULT_TASK_STATE_MAX_AGE_MS;
-  /** Threads this tracker registered, settled, or cleared; only their records are ever rewritten. */
-  const touchedThreads = new Set<string>();
-  let lastWritten = '';
   const taskKey = (task: Pick<BackgroundTask, 'taskType' | 'taskId'>) => `${task.taskType === 'local_subagent' ? 'subagent' : 'task'}:${task.taskId}`;
   // Silent-turn detection state (issue: turn ends with no agent message after a failed
   // command with empty output, so BB records "No final output was recorded").
@@ -250,21 +230,11 @@ export function createBackgroundTaskTracker(options: {
     ...(task.transcriptPath ? { transcriptPath: task.transcriptPath } : {}),
     ...(task.outputFile ? { outputFile: task.outputFile } : {}),
   });
-  /**
-   * Merges this tracker's live tasks into the state file: records for the threads this tracker
-   * has touched are replaced with the in-memory tasks (dropping settled/cleared ones), and every
-   * other thread's records are preserved, so concurrent plugin hosts never clobber each other.
-   */
-  function persistState() {
+  function persistState(thread: string) {
     if (!persistPath) return;
-    const previous = readTaskState(persistPath, maxAge);
-    const records = [
-      ...previous.filter(record => !touchedThreads.has(record.threadId)),
-      ...[...touchedThreads].flatMap(thread => [...(threads.get(thread)?.values() ?? [])].map(task => toRecord(thread, task))),
-    ].sort((a, b) => a.threadId === b.threadId ? a.taskId.localeCompare(b.taskId) : a.threadId.localeCompare(b.threadId));
-    const json = JSON.stringify({ version: 1, tasks: records });
-    if (json === lastWritten) return;
-    if (writeTaskState(persistPath, records)) lastWritten = json;
+    const records = readTaskState(persistPath, maxAge).filter(record => record.threadId !== thread);
+    for (const task of threads.get(thread)?.values() ?? []) records.push(toRecord(thread, task));
+    writeTaskState(persistPath, records);
   }
   /**
    * Restart reconciliation: `clearThread`-shaped `interrupted` closes for persisted tasks of a
@@ -281,8 +251,7 @@ export function createBackgroundTaskTracker(options: {
       taskId: record.taskId, taskType: record.taskType, description: record.description, parentToolCallId: record.parentToolCallId,
       ...(record.transcriptPath ? { transcriptPath: record.transcriptPath } : {}), ...(record.outputFile ? { outputFile: record.outputFile } : {}),
     }, 'interrupted', 'stopped'));
-    touchedThreads.add(thread);
-    persistState();
+    persistState(thread);
     return results;
   }
   function syncPolling() {
@@ -302,7 +271,7 @@ export function createBackgroundTaskTracker(options: {
     }
     if (!tasks?.size) threads.delete(thread);
     syncPolling();
-    if (results.length) { touchedThreads.add(thread); persistState(); }
+    if (results.length) persistState(thread);
     return results;
   }
   function inspectTextForCompletions(thread: string, text: string): BackgroundTaskDelta[] {
@@ -403,7 +372,7 @@ export function createBackgroundTaskTracker(options: {
     const tasks = threads.get(thread) ?? new Map<string, BackgroundTask>();
     if (tasks.has(taskKey(task))) return results;
     tasks.set(taskKey(task), task); threads.set(thread, tasks);
-    touchedThreads.add(thread); persistState();
+    persistState(thread);
     if (task.transcriptPath && interval > 0) {
       const paths = watchers.get(thread) ?? new Map();
       if (!paths.has(task.transcriptPath)) {
@@ -420,7 +389,7 @@ export function createBackgroundTaskTracker(options: {
   function clearThread(thread: string, emitCloseDeltas = false): BackgroundTaskDelta[] {
     const results = emitCloseDeltas ? getActiveTasks(thread).map(task => delta(task, 'interrupted', 'stopped')) : [];
     threads.delete(thread); threadTools.delete(thread); streamBuffers.delete(thread); silentTurns.delete(thread); syncPolling();
-    touchedThreads.add(thread); persistState(); return results;
+    persistState(thread); return results;
   }
   // Startup load: snapshot which records predate this host process (only those are eligible for
   // reconciliation) and flush a GC pass so records older than the max age cannot accumulate
@@ -429,8 +398,9 @@ export function createBackgroundTaskTracker(options: {
   // next resume must still report the tasks as interrupted.
   const initialRecordKeys = new Set<string>();
   if (persistPath) {
-    for (const record of readTaskState(persistPath, maxAge)) initialRecordKeys.add(`${record.threadId}\u0000${record.taskId}`);
-    persistState();
+    const records = readTaskState(persistPath, maxAge);
+    for (const record of records) initialRecordKeys.add(`${record.threadId}\u0000${record.taskId}`);
+    writeTaskState(persistPath, records);
   }
   return {
     recordToolEvent(event: RecordedToolEvent) {

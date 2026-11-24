@@ -261,6 +261,17 @@ test('registration persists a versioned record and settling removes it', t => {
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).tasks.length, 0);
 });
 
+test('a tracker leaves a handed-off thread alone when saving another thread', t => {
+  const path = statePath(t);
+  const first = tracker(t, { persistPath: path });
+  first.handleToolEventForThread('moved', command('old'));
+  first.clearThread('moved');
+  const second = tracker(t, { persistPath: path });
+  second.handleToolEventForThread('moved', command('new'));
+  first.handleToolEventForThread('other', command('keep'));
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).tasks.map(task => task.taskId).sort(), ['keep', 'new']);
+});
+
 test('simulated host restart emits interrupted close deltas on resume and drops the records', t => {
   const path = statePath(t);
   const first = tracker(t, { persistPath: path });

@@ -43,7 +43,7 @@ Work mode and permissions are separate controls:
 
 ## Requirements and settings
 
-- `agy` must be installed and on `PATH` on the target host (`agy --version`, `agy acp --help`).
+- `agy` must be installed on the target host, on `PATH` or in the standard installer location (`agy --version`, `agy acp --help`).
 - Sign in on the target host with `agy acp --login`.
 - Plugin settings (`Settings -> Installed plugins -> Antigravity CLI`):
   - `enabled` (default `true`): show or hide `antigravity-cli` in the provider picker.
