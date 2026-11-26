@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, parse } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -103,7 +103,7 @@ test('launch searches the quoted Windows host PATH and ignores session PATH', { 
 
 test('explicit executable paths are preserved', () => {
   const request = { params: { providerOptions: { acpLaunchSpec: { command: process.execPath } } } };
-  resolveAntigravityLaunchSpec(request);
+  assert.equal(resolveAntigravityLaunchSpec(request), true);
   assert.equal(request.params.providerOptions.acpLaunchSpec.command, process.execPath);
 });
 
@@ -264,5 +264,110 @@ test('provider health uses one version probe and explains when agy is too old', 
     } else {
       assert.deepEqual(readFileSync(probeLog, 'utf8').trim().split(/\r?\n/), ['--version']);
     }
+  }
+});
+
+test('profile directory env vars append --gemini-dir and --app-data-dir to acp launch args', () => {
+  for (const nested of [false, true]) {
+    const spec = { command: process.execPath, args: ['acp', '--disable-telemetry'], env: {} };
+    const envVars = {
+      BB_ANTIGRAVITY_GEMINI_DIR: '/var/lib/bb/agy-profiles/acct-1/.gemini',
+      BB_ANTIGRAVITY_APP_DATA_DIR: 'antigravity-cli',
+    };
+    const request = {
+      params: nested
+        ? { options: { providerOptions: { acpLaunchSpec: spec }, envVars } }
+        : { providerOptions: { acpLaunchSpec: spec }, envVars },
+    };
+    assert.equal(resolveAntigravityLaunchSpec(request), true);
+    assert.deepEqual(spec.args, [
+      'acp',
+      '--disable-telemetry',
+      '--gemini-dir',
+      '/var/lib/bb/agy-profiles/acct-1/.gemini',
+      '--app-data-dir',
+      'antigravity-cli',
+    ]);
+  }
+});
+
+test('empty env overrides neutralize inherited profile directory env vars without duplicating explicit flags', () => {
+  const original = process.env.BB_ANTIGRAVITY_GEMINI_DIR;
+  process.env.BB_ANTIGRAVITY_GEMINI_DIR = '/inherited/.gemini';
+  try {
+    const neutralized = { command: process.execPath, args: ['acp'], env: {} };
+    assert.equal(resolveAntigravityLaunchSpec({
+      params: {
+        options: {
+          providerOptions: { acpLaunchSpec: neutralized },
+          envVars: { BB_ANTIGRAVITY_GEMINI_DIR: '' },
+        },
+      },
+    }), true);
+    assert.deepEqual(neutralized.args, ['acp']);
+
+    const explicit = { command: process.execPath, args: ['acp', '--gemini-dir', '/explicit/.gemini'], env: {} };
+    assert.equal(resolveAntigravityLaunchSpec({
+      params: {
+        options: {
+          providerOptions: { acpLaunchSpec: explicit },
+          envVars: { BB_ANTIGRAVITY_GEMINI_DIR: '/override/.gemini' },
+        },
+      },
+    }), true);
+    assert.deepEqual(explicit.args, ['acp', '--gemini-dir', '/explicit/.gemini']);
+  } finally {
+    if (original === undefined) delete process.env.BB_ANTIGRAVITY_GEMINI_DIR;
+    else process.env.BB_ANTIGRAVITY_GEMINI_DIR = original;
+  }
+});
+
+test('executable discovery uses host env while profile flags read allowlisted session envVars', () => {
+  const root = mkdtempSync(join(tmpdir(), 'agy-host-env-'));
+  const hostBin = join(root, 'host-bin');
+  const sessionBin = join(root, 'session-bin');
+  const binName = process.platform === 'win32' ? 'agy.cmd' : 'agy';
+  const hostExecutable = join(hostBin, binName);
+  const sessionExecutable = join(sessionBin, binName);
+  try {
+    mkdirSync(hostBin, { recursive: true });
+    mkdirSync(sessionBin, { recursive: true });
+    writeFileSync(hostExecutable, process.platform === 'win32' ? '@echo off\r\n' : '#!/bin/sh\n');
+    writeFileSync(sessionExecutable, process.platform === 'win32' ? '@echo off\r\n' : '#!/bin/sh\n');
+    if (process.platform !== 'win32') {
+      chmodSync(hostExecutable, 0o755);
+      chmodSync(sessionExecutable, 0o755);
+    }
+
+    const resolvedSpec = {
+      command: 'agy',
+      args: ['acp', '--disable-telemetry'],
+      env: { PATH: hostBin, HOME: root, USERPROFILE: root, LOCALAPPDATA: root },
+    };
+    const resolved = resolveAntigravityLaunchSpec({
+      params: {
+        options: {
+          providerOptions: { acpLaunchSpec: resolvedSpec },
+          envVars: {
+            PATH: sessionBin,
+            LOCALAPPDATA: sessionBin,
+            BB_ANTIGRAVITY_GEMINI_DIR: '/profiles/alpha/.gemini',
+            BB_ANTIGRAVITY_APP_DATA_DIR: 'antigravity-cli',
+          },
+        },
+      },
+    });
+    assert.equal(resolved, true);
+    assert.equal(resolvedSpec.command, hostExecutable);
+    assert.deepEqual(resolvedSpec.args, [
+      'acp',
+      '--disable-telemetry',
+      '--gemini-dir',
+      '/profiles/alpha/.gemini',
+      '--app-data-dir',
+      'antigravity-cli',
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

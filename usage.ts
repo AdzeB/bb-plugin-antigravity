@@ -1,8 +1,17 @@
+import { access, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { experimental_execHostFile } from "@get-bb/plugin-sdk/process";
 import type { ProviderUsageResult } from "@get-bb/plugin-sdk/provider-bridge";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { resolveAntigravityCommand } from "./cli.ts";
+import {
+  DEFAULT_ANTIGRAVITY_APP_DATA_DIR,
+  DEFAULT_ANTIGRAVITY_GEMINI_DIR,
+  readAntigravityProfileOverrides,
+  resolveAntigravityCommand,
+  resolveAntigravityProfilePaths,
+} from "./cli.ts";
 
 const USAGE_TIMEOUT_MS = 15_000;
 const USAGE_CACHE_TTL_MS = 60_000;
@@ -194,6 +203,62 @@ function isExpiredFailure(text: string): boolean {
   );
 }
 
+async function directoryExists(dirPath: string): Promise<boolean> {
+  try {
+    await access(dirPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function prepareHostUsageEnv(
+  hostEnv: NodeJS.ProcessEnv,
+): Promise<{ env: NodeJS.ProcessEnv; cleanup: () => Promise<void> }> {
+  const profile = readAntigravityProfileOverrides(hostEnv);
+  if (profile.geminiDir === null && profile.appDataDir === null) {
+    return { env: hostEnv, cleanup: async () => {} };
+  }
+
+  const { geminiDir, appDataDir, effectiveAppDataDir } = resolveAntigravityProfilePaths(profile, hostEnv);
+  if (
+    basename(geminiDir) === DEFAULT_ANTIGRAVITY_GEMINI_DIR &&
+    effectiveAppDataDir === DEFAULT_ANTIGRAVITY_APP_DATA_DIR &&
+    dirname(geminiDir) !== geminiDir
+  ) {
+    const profileHome = dirname(geminiDir);
+    return {
+      env: { ...hostEnv, HOME: profileHome, USERPROFILE: profileHome },
+      cleanup: async () => {},
+    };
+  }
+
+  const tempHome = await mkdtemp(join(tmpdir(), "bb-agy-usage-"));
+  const cleanup = async () => {
+    await rm(tempHome, { recursive: true, force: true }).catch(() => {});
+  };
+  try {
+    const linkType = process.platform === "win32" ? "junction" : "dir";
+    if (effectiveAppDataDir === DEFAULT_ANTIGRAVITY_APP_DATA_DIR) {
+      if (await directoryExists(geminiDir)) {
+        await symlink(geminiDir, join(tempHome, DEFAULT_ANTIGRAVITY_GEMINI_DIR), linkType);
+      }
+    } else {
+      await mkdir(join(tempHome, DEFAULT_ANTIGRAVITY_GEMINI_DIR), { recursive: true });
+      if (await directoryExists(appDataDir)) {
+        await symlink(appDataDir, join(tempHome, DEFAULT_ANTIGRAVITY_GEMINI_DIR, DEFAULT_ANTIGRAVITY_APP_DATA_DIR), linkType);
+      }
+    }
+    return {
+      env: { ...hostEnv, HOME: tempHome, USERPROFILE: tempHome },
+      cleanup,
+    };
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+}
+
 export async function readAntigravityProviderUsage(options?: {
   command?: string;
   cwd?: string;
@@ -203,25 +268,34 @@ export async function readAntigravityProviderUsage(options?: {
 }): Promise<ProviderUsageResult> {
   const command = options?.command ?? "agy";
   const cwd = options?.cwd ?? process.cwd();
-  const env = options?.env ?? process.env;
+  const hostEnv = options?.env ?? process.env;
   const resolveCommand = options?.resolveCommand ?? resolveAntigravityCommand;
   const execFile = options?.execFile ?? experimental_execHostFile;
 
   try {
-    const resolvedCommand = command ? await resolveCommand(command, { cwd, env }) : null;
+    const resolvedCommand = command ? await resolveCommand(command, { cwd, env: hostEnv }) : null;
     if (!resolvedCommand) {
       return { supported: true, usage: { status: "not_installed" } };
     }
-    const { stdout, stderr } = await execFile(
-      resolvedCommand,
-      ["-p", "/usage", "--output-format", "json"],
-      {
-        cwd,
-        env,
-        timeout: USAGE_TIMEOUT_MS,
-        maxBuffer: 1024 * 1024,
-      },
-    );
+    const prepared = await prepareHostUsageEnv(hostEnv);
+    let stdout = "";
+    let stderr = "";
+    try {
+      const output = await execFile(
+        resolvedCommand,
+        ["-p", "/usage", "--output-format", "json"],
+        {
+          cwd,
+          env: prepared.env,
+          timeout: USAGE_TIMEOUT_MS,
+          maxBuffer: 1024 * 1024,
+        },
+      );
+      stdout = output.stdout;
+      stderr = output.stderr;
+    } finally {
+      await prepared.cleanup();
+    }
     const combined = `${stdout}\n${stderr}`;
     const normalized = normalizeAntigravityUsageOutput(stdout);
     const usage = normalized.usage as { status: string };

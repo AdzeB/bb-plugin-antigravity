@@ -1,5 +1,10 @@
 import { experimental_acpLaunchSpecSchema, experimental_acpProviderBridge } from "@get-bb/plugin-sdk/provider-bridge/acp";
-import { threadStartParamsSchema, threadResumeParamsSchema, turnStartParamsSchema } from "@get-bb/plugin-sdk/provider-bridge";
+import {
+  experimental_buildProviderCliEnv,
+  threadStartParamsSchema,
+  threadResumeParamsSchema,
+  turnStartParamsSchema,
+} from "@get-bb/plugin-sdk/provider-bridge";
 import type { ProviderHealthResult, ProviderInstallationStatus } from "@get-bb/plugin-sdk/provider-bridge";
 import { createBackgroundTaskTracker, defaultBackgroundTaskStatePath } from "./background-tasks.ts";
 import { ANTIGRAVITY_ACP_DIALECT_ID, applyThreadCommandDescriptions, onToolUpdate, registerAntigravityAcpDialect } from "./dialect.ts";
@@ -7,7 +12,13 @@ import { modeControlOutput } from "./mode-controls.ts";
 import { mapPromptMode } from "./prompt-mode.ts";
 import { interceptSubagentApproval, isSubagentApprovalForDisabledThread, transformSubagentRequest } from "./subagents.ts";
 import { readAntigravityProviderUsage } from "./usage.ts";
-import { resolveAntigravityLaunchSpec } from "./cli.ts";
+import { extractAntigravityProfileFromLaunchSpec, resolveAntigravityLaunchSpec } from "./cli.ts";
+import {
+  ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE,
+  createSessionProfileStore,
+  defaultProfileBindingsPath,
+  hashAntigravityProfile,
+} from "./profile-bindings.ts";
 
 registerAntigravityAcpDialect();
 
@@ -89,6 +100,40 @@ function missingCliResponse(method: unknown) {
 let stdoutFilterInstalled = false;
 const autoApproveThreads = new Map<string, boolean>();
 const commandDescriptionsThreads = new Map<string, boolean>();
+const sessionProfileStore = createSessionProfileStore({
+  persistPath: defaultProfileBindingsPath(),
+});
+const pendingProfileBindings = new Map<string, { threadId: string; profileHash: string }>();
+
+function recordSessionProfileFromResponse(line: string): string {
+  if (pendingProfileBindings.size === 0) return line;
+  let message: any;
+  try { message = JSON.parse(line); } catch { return line; }
+  if (!message || typeof message !== "object" || message.jsonrpc !== "2.0") return line;
+  if (typeof message.id !== "string" && typeof message.id !== "number") return line;
+  const key = String(message.id);
+  const pending = pendingProfileBindings.get(key);
+  if (!pending) return line;
+  pendingProfileBindings.delete(key);
+  const providerThreadId = message.result?.providerThreadId;
+  if (typeof providerThreadId === "string" && providerThreadId.length > 0) {
+    sessionProfileStore.bind({
+      threadId: pending.threadId,
+      providerThreadId,
+      profileHash: pending.profileHash,
+    });
+  }
+  return line;
+}
+
+function resolveRequestProfileHash(record: Record<string, any>): string | null {
+  const options = record.params?.options;
+  const spec = options?.providerOptions?.acpLaunchSpec;
+  if (!spec || typeof spec !== "object") return null;
+  const hostEnv = experimental_buildProviderCliEnv(spec.env);
+  const profile = extractAntigravityProfileFromLaunchSpec(spec, hostEnv, options?.envVars);
+  return hashAntigravityProfile(profile, hostEnv);
+}
 
 export function rememberApprovalSetting(request: any) {
   if (request?.method === "thread/stop" || request?.method === "thread/discard") {
@@ -183,7 +228,9 @@ function ensureStdoutFilter() {
   rawStdoutWrite = write;
   const output = modeControlOutput(
     interceptApproval,
-    line => backgroundTaskTracker.processStdoutLine(applyThreadCommandDescriptions(line, commandDescriptionsThreads)),
+    line => backgroundTaskTracker.processStdoutLine(
+      applyThreadCommandDescriptions(recordSessionProfileFromResponse(line), commandDescriptionsThreads),
+    ),
   );
   output.on("data", chunk => write(chunk));
   process.stdout.write = ((chunk: any, encodingOrCallback?: any, callback?: any) =>
@@ -199,7 +246,9 @@ export const experimental_providerBridge = {
     ensureStdoutFilter();
     let parsed: unknown;
     try { parsed = JSON.parse(line); } catch { parsed = null; }
-    const request = parsed as { jsonrpc?: unknown; id?: unknown; method?: unknown } | null;
+    const request = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, any>)
+      : null;
     if (request?.method !== "initialize" && !resolveAntigravityLaunchSpec(parsed)) {
       const id = request?.id;
       if (request?.jsonrpc === "2.0" && (typeof id === "string" || typeof id === "number")) {
@@ -207,6 +256,45 @@ export const experimental_providerBridge = {
       }
       return;
     }
+
+    if (request?.method === "thread/discard") {
+      sessionProfileStore.forget({
+        threadId: typeof request.params?.threadId === "string" ? request.params.threadId : undefined,
+        providerThreadId: typeof request.params?.providerThreadId === "string" ? request.params.providerThreadId : undefined,
+      });
+    } else if (
+      request &&
+      (request.method === "thread/start" || request.method === "thread/resume" || request.method === "turn/start")
+    ) {
+      const profileHash = resolveRequestProfileHash(request);
+      if (profileHash !== null) {
+        const id = typeof request.id === "string" || typeof request.id === "number" ? request.id : null;
+        const threadId = typeof request.params?.threadId === "string" ? request.params.threadId : undefined;
+        const providerThreadId = typeof request.params?.providerThreadId === "string"
+          ? request.params.providerThreadId
+          : undefined;
+        if (
+          (request.method === "thread/resume" || request.method === "turn/start") &&
+          sessionProfileStore.checkMismatch({ threadId, providerThreadId, profileHash })
+        ) {
+          if (request.jsonrpc === "2.0" && id !== null) {
+            process.stdout.write(`${JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              error: {
+                code: -32000,
+                message: ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE,
+              },
+            })}\n`);
+          }
+          return;
+        }
+        if ((request.method === "thread/start" || request.method === "thread/resume") && id !== null && threadId) {
+          pendingProfileBindings.set(String(id), { threadId, profileHash });
+        }
+      }
+    }
+
     if (parsed !== null) line = JSON.stringify(parsed);
     const withDefaults = applyAntigravityDefaults(line, parsed);
     // Runs first: a steer into a held turn is rewritten to turn/start, which the transforms below

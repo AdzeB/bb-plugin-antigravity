@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   formatBucketWindowLabel,
   normalizeAntigravityUsageOutput,
@@ -1043,4 +1046,67 @@ test('older listResources does not overwrite newer knownResources label', async 
   host1Status = 'disconnected';
   const disconnectedList = await listResources({});
   assert.equal(disconnectedList.resources[0].label, 'New Label');
+});
+
+test('host-scoped usage honors host profile env overrides while keeping command resolution on host env', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'agy-host-usage-profile-'));
+  const hostHome = join(root, 'host-home');
+  const alphaHome = join(root, 'alpha-home');
+  const alphaGemini = join(alphaHome, '.gemini');
+  const betaRoot = join(root, 'beta-custom');
+  const betaAppData = join(betaRoot, 'work-app');
+  try {
+    mkdirSync(join(alphaGemini, 'antigravity-cli'), { recursive: true });
+    mkdirSync(betaAppData, { recursive: true });
+    writeFileSync(join(betaAppData, 'marker.txt'), 'beta-host-profile');
+
+    const canonicalHostEnv = {
+      ...process.env,
+      HOME: hostHome,
+      USERPROFILE: hostHome,
+      PATH: '/host/bin',
+      BB_ANTIGRAVITY_GEMINI_DIR: alphaGemini,
+      BB_ANTIGRAVITY_APP_DATA_DIR: 'antigravity-cli',
+    };
+    let resolveEnvSeen;
+    let alphaExecEnv;
+    await readAntigravityProviderUsage({
+      env: canonicalHostEnv,
+      resolveCommand: (_cmd, opts) => {
+        resolveEnvSeen = opts?.env;
+        return '/host/bin/agy';
+      },
+      execFile: async (_cmd, _args, opts) => {
+        alphaExecEnv = opts?.env;
+        return { stdout: SAMPLE_USAGE_JSON, stderr: '' };
+      },
+    });
+    assert.equal(resolveEnvSeen?.HOME, hostHome);
+    assert.equal(resolveEnvSeen?.PATH, '/host/bin');
+    assert.equal(alphaExecEnv?.HOME, alphaHome);
+    assert.equal(alphaExecEnv?.USERPROFILE, alphaHome);
+
+    let betaTempHome;
+    let markerRead;
+    await readAntigravityProviderUsage({
+      env: {
+        ...process.env,
+        HOME: hostHome,
+        USERPROFILE: hostHome,
+        BB_ANTIGRAVITY_GEMINI_DIR: betaRoot,
+        BB_ANTIGRAVITY_APP_DATA_DIR: 'work-app',
+      },
+      resolveCommand: () => '/host/bin/agy',
+      execFile: async (_cmd, _args, opts) => {
+        betaTempHome = opts?.env?.HOME;
+        markerRead = readFileSync(join(betaTempHome, '.gemini', 'antigravity-cli', 'marker.txt'), 'utf8');
+        return { stdout: SAMPLE_USAGE_JSON, stderr: '' };
+      },
+    });
+    assert.equal(markerRead, 'beta-host-profile');
+    assert.ok(betaTempHome && betaTempHome !== hostHome);
+    assert.equal(existsSync(betaTempHome), false, 'temporary usage home should be cleaned up');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
