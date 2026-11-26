@@ -129,6 +129,41 @@ async function rejectRoute(method, params) {
   assert.equal(readInvocations().length, before, 'profile rejection must happen before invoking agy');
 }
 
+async function stopQueuedSteer(threadId, envVars, rejectSteer) {
+  const opening = send('thread/start', {
+    threadId, cwd: root, instructionMode: 'append', options: makeOptions(envVars),
+  });
+  const providerThreadId = (await wait(m => m.id === opening)).result?.providerThreadId;
+  assert.match(providerThreadId, /^antigravity-profile:/);
+  const turn = send('turn/start', {
+    threadId, providerThreadId, clientRequestId: 'creq_23456789ar',
+    input: [{ type: 'text', text: rejectSteer ? 'wait-for-steer-error' : 'wait-for-steer' }],
+    options: makeOptions(envVars),
+  });
+  assert.equal((await wait(m => m.id === turn)).error, undefined);
+
+  const clientRequestId = 'creq_23456789as';
+  const steer = send('turn/steer', {
+    threadId, providerThreadId, expectedTurnId: 'turn-1', clientRequestId,
+    input: [{ type: 'text', text: 'identify' }],
+    options: makeOptions({ ...envVars, SYNTHETIC_REBUILD: '1' }),
+  });
+  const stop = send('thread/stop', { threadId, providerThreadId, intent: 'release', activeTurnId: null });
+  const queued = await wait(m => m.id === steer);
+  assert.deepEqual(queued.result, { threadId });
+  const stopped = await wait(m => m.id === stop);
+  assert.equal(stopped.result?.ok, true);
+  const settling = messages.slice(messages.indexOf(queued) + 1, messages.indexOf(stopped));
+  if (rejectSteer) {
+    assert.ok(settling.some(m => m.method === 'error' && m.params.threadId === threadId), 'SDK failure must release the deferred stop');
+  } else {
+    assert.ok(settling.some(m => m.method === 'thread/delta' && m.params.threadId === threadId &&
+      m.params.deltas.some(d => d.kind === 'input.accepted' && d.clientRequestId === clientRequestId)),
+    'queued steer must reach the replacement before stop is acknowledged');
+  }
+  assert.ok(!settling.some(m => m.params?.threadId === threadId && ['thread/identity', 'session/replaced'].includes(m.method)));
+}
+
 const alphaEnv = {
   PATH: untrustedBin,
   LOCALAPPDATA: untrustedBin,
@@ -338,6 +373,41 @@ try {
     assert.match(driftTurnRes.error.message, /different profile/i);
     assert.equal(readInvocations().length, invocationsBeforeDrift, 'drifted turn/start must not spawn Profile B');
 
+    // The SDK can acknowledge stop while its earlier turn is still replacing the old process.
+    const raceStart = messages.length;
+    const racingTurnId = send('turn/start', {
+      threadId: 'thread-alpha', providerThreadId: replacementId, clientRequestId: 'creq_23456789an',
+      input: [{ type: 'text', text: 'identify' }],
+      options: makeOptions({ ...rebuildEnv, SYNTHETIC_STOP_RACE: '1' }),
+    });
+    const stopId = send('thread/stop', {
+      threadId: 'thread-alpha', providerThreadId: replacementId, intent: 'release', activeTurnId: null,
+    });
+    const reopeningId = send('thread/start', {
+      threadId: 'thread-alpha', cwd: root, instructionMode: 'append', options: makeOptions(undefined, undefined, false),
+    });
+    assert.match((await wait(m => m.id === reopeningId)).error?.message, /stopping/i);
+    const stopResponse = await wait(m => m.id === stopId);
+    assert.equal(stopResponse.result?.ok, true);
+    const raced = await wait(m => m.id === racingTurnId);
+    assert.ok(messages.indexOf(raced) < messages.indexOf(stopResponse), 'stop must wait for the submitted input and replacement');
+    assert.equal(raced.error, undefined, JSON.stringify(raced));
+    const lateIdentities = messages.slice(raceStart).filter(m =>
+      m.params?.threadId === 'thread-alpha' && ('providerThreadId' in m.params));
+    assert.deepEqual(lateIdentities, [], 'the stopped session must not publish its replacement identity');
+    const stoppedInvocations = readInvocations();
+    const stoppedProcess = stoppedInvocations.findLast(entry => entry.mode === 'acp' && entry.accountId === 'synthetic-alpha');
+    assert.throws(() => process.kill(stoppedProcess.pid, 0), { code: 'ESRCH' }, 'stop must release the replacement process');
+    const defaultPromptId = send('turn/start', {
+      threadId: 'thread-alpha', providerThreadId: 'session-synthetic-alpha-3', clientRequestId: 'creq_23456789ap',
+      input: [{ type: 'text', text: 'identify' }], options: makeOptions(undefined, undefined, false),
+    });
+    assert.match((await wait(m => m.id === defaultPromptId)).error?.message, /no active/i);
+    assert.equal(readInvocations().length, stoppedInvocations.length);
+
+    const reopened = send('thread/resume', { ...alphaResume, providerThreadId: replacementId });
+    assert.equal((await wait(m => m.id === reopened)).result?.providerThreadId, replacementId);
+
     // 5. Switching Profile B -> Profile A must fail visibly before opening Profile A
     const invocationsBeforeBetaMismatch = readInvocations().length;
     const betaMismatchId = send('thread/resume', {
@@ -369,6 +439,13 @@ try {
       ...alphaResume, threadId: 'thread-default', providerThreadId: defaultSessionId, options: makeOptions({}),
     });
     assert.equal((await wait(m => m.id === defaultResumeId)).result?.providerThreadId, defaultSessionId);
+    const rebuiltDefault = await runTurn('thread-default', defaultSessionId, 'creq_23456789aq', { SYNTHETIC_REBUILD: '1' }, false);
+    assert.deepEqual(rebuiltDefault, { accountId: 'synthetic-default', sessionId: 'session-synthetic-default-2', resumed: false });
+    const defaultReplacement = await wait(m => m.method === 'session/replaced' && m.params.threadId === 'thread-default');
+    assert.equal(defaultReplacement.params.providerThreadId, rebuiltDefault.sessionId);
+
+    await stopQueuedSteer('thread-steer-rebuild', alphaEnv, false);
+    await stopQueuedSteer('thread-steer-error', alphaEnv, true);
 
     const turn = {
       threadId: 'thread-beta', providerThreadId: betaSessionId, clientRequestId: 'creq_23456789ah',

@@ -105,6 +105,8 @@ type PendingIdentity = { threadId: string; profileHash?: string; stop?: true };
 type SessionIdentity = { profileHash?: string; sessionId: string };
 const pendingIdentities = new Map<string | number, PendingIdentity>();
 const activeIdentities = new Map<string, SessionIdentity>();
+const pendingInputs = new Map<string | number, { threadId: string; clientRequestId: string; steer: boolean }>();
+const deferredStops = new Map<string, string>();
 
 function pendingIdentityForThread(threadId: string): PendingIdentity | undefined {
   for (const pending of pendingIdentities.values()) {
@@ -116,17 +118,58 @@ function profileError(message: string) {
   return { code: -32000, message };
 }
 
-function wrapProfileSessionIds(line: string): string {
-  if (pendingIdentities.size === 0 && activeIdentities.size === 0) return line;
+function hasPendingSessionWork(threadId: string): boolean {
+  return pendingIdentityForThread(threadId)?.profileHash !== undefined ||
+    [...pendingInputs.values()].some(input => input.threadId === threadId);
+}
+
+function flushDeferredStop(threadId: string): void {
+  const line = deferredStops.get(threadId);
+  if (line === undefined || hasPendingSessionWork(threadId)) return;
+  // SDK output is synchronous. Let the current SDK operation finish before forwarding stop.
+  queueMicrotask(() => {
+    if (deferredStops.get(threadId) !== line || hasPendingSessionWork(threadId)) return;
+    deferredStops.delete(threadId);
+    experimental_providerBridge.handleLine(line);
+  });
+}
+
+function settlePendingInputs(message: any): void {
+  if (message.method === undefined) {
+    const input = pendingInputs.get(message.id);
+    if (input && (!input.steer || message.error)) {
+      pendingInputs.delete(message.id);
+      flushDeferredStop(input.threadId);
+    }
+    return;
+  }
+  const threadId = message.params?.threadId;
+  const deltas = message.method === "thread/delta" && Array.isArray(message.params?.deltas) ? message.params.deltas : [];
+  if (typeof threadId !== "string" || (deltas.length === 0 && message.method !== "error")) return;
+  // The SDK acknowledges ordinary steers when queued. Acceptance or turn termination
+  // is what establishes that the SDK can no longer rebuild to execute that input.
+  const ended = message.method === "error" || deltas.some((delta: any) => delta.kind === "turn.boundary");
+  for (const [id, input] of pendingInputs) {
+    if (input.threadId !== threadId || !input.steer) continue;
+    if (ended || deltas.some((delta: any) => delta.kind === "input.accepted" && delta.clientRequestId === input.clientRequestId)) {
+      pendingInputs.delete(id);
+    }
+  }
+  flushDeferredStop(threadId);
+}
+
+function wrapProfileSessionIds(line: string): string | null {
   let message: any;
   try { message = JSON.parse(line); } catch { return line; }
   if (message?.jsonrpc !== "2.0") return line;
+  if (pendingInputs.size > 0) settlePendingInputs(message);
 
   if (message.method === undefined) {
     const pending = pendingIdentities.get(message.id);
     if (!pending) return line;
     pendingIdentities.delete(message.id);
     const { threadId, profileHash, stop } = pending;
+    flushDeferredStop(threadId);
     if (stop) {
       if (message.result?.ok === true) activeIdentities.delete(threadId);
       return line;
@@ -146,7 +189,12 @@ function wrapProfileSessionIds(line: string): string {
   const { threadId, providerThreadId } = message.params ?? {};
   if (typeof threadId !== "string" || typeof providerThreadId !== "string") return line;
   const active = activeIdentities.get(threadId);
-  const profileHash = active?.profileHash ?? pendingIdentityForThread(threadId)?.profileHash;
+  const pending = pendingIdentityForThread(threadId);
+  if (!active && (!pending || pending.stop)) return null;
+  if (message.method === "thread/identity" || message.method === "session/replaced") {
+    if (deferredStops.has(threadId) || pending?.stop) return null;
+  }
+  const profileHash = active?.profileHash ?? pending?.profileHash;
   // BB persists this SDK notification when a process rebuild changes the native session ID.
   if (message.method === "session/replaced" && active) active.sessionId = providerThreadId;
   if (profileHash === undefined) return line;
@@ -162,6 +210,9 @@ function guardProfileSession(request: Record<string, any> | null): string | unde
   const id = request?.jsonrpc === "2.0" && (typeof request.id === "string" || typeof request.id === "number")
     ? request.id : undefined;
   if (method === "thread/fork") return "Antigravity does not support forking threads.";
+  if ((deferredStops.has(threadId) || pendingIdentityForThread(threadId)?.stop) && method !== "thread/discard") {
+    return "Antigravity is stopping this session. Try again when it has stopped.";
+  }
 
   const sessionId = decodeProfileSessionId(params.providerThreadId);
   if (method === "thread/stop" || method === "thread/discard") {
@@ -198,6 +249,8 @@ function guardProfileSession(request: Record<string, any> | null): string | unde
   if (startsSession) {
     if (id === undefined) return ANTIGRAVITY_INVALID_PROFILE_MESSAGE;
     pendingIdentities.set(id, { threadId, profileHash });
+  } else if (!active) {
+    return "No active ACP session.";
   }
 }
 
@@ -294,9 +347,12 @@ function ensureStdoutFilter() {
   rawStdoutWrite = write;
   const output = modeControlOutput(
     interceptApproval,
-    line => backgroundTaskTracker.processStdoutLine(
-      applyThreadCommandDescriptions(wrapProfileSessionIds(line), commandDescriptionsThreads),
-    ),
+    line => {
+      const wrapped = wrapProfileSessionIds(line);
+      return wrapped === null ? [] : backgroundTaskTracker.processStdoutLine(
+        applyThreadCommandDescriptions(wrapped, commandDescriptionsThreads),
+      );
+    },
   );
   output.on("data", chunk => write(chunk));
   process.stdout.write = ((chunk: any, encodingOrCallback?: any, callback?: any) =>
@@ -320,6 +376,17 @@ export const experimental_providerBridge = {
       if (request?.jsonrpc === "2.0" && (typeof id === "string" || typeof id === "number")) {
         process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, ...missingCliResponse(request.method) })}\n`);
       }
+      return;
+    }
+
+    const threadId = request?.params?.threadId;
+    if (request?.method === "thread/stop" && request.jsonrpc === "2.0" &&
+        (typeof request.id === "string" || typeof request.id === "number") &&
+        typeof threadId === "string" && !deferredStops.has(threadId) &&
+        !pendingIdentityForThread(threadId)?.stop && hasPendingSessionWork(threadId)) {
+      // The SDK can acknowledge a second stop on the old process while a replacement is
+      // between processes. Send stop only after all forwarded input/setup has settled.
+      deferredStops.set(threadId, line);
       return;
     }
 
@@ -372,6 +439,17 @@ export const experimental_providerBridge = {
         process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: usageRequest.id, result })}\n`);
       });
       return;
+    }
+    const forwarded = subagentTransformed.parsed as Record<string, any> | null;
+    if ((forwarded?.method === "turn/start" || forwarded?.method === "turn/steer") &&
+        forwarded.jsonrpc === "2.0" && (typeof forwarded.id === "string" || typeof forwarded.id === "number") &&
+        typeof forwarded.params?.threadId === "string" && typeof forwarded.params?.clientRequestId === "string" &&
+        activeIdentities.get(forwarded.params.threadId)?.profileHash !== undefined) {
+      pendingInputs.set(forwarded.id, {
+        threadId: forwarded.params.threadId,
+        clientRequestId: forwarded.params.clientRequestId,
+        steer: forwarded.method === "turn/steer",
+      });
     }
     experimental_acpProviderBridge.handleLine(mapPromptMode(subagentTransformed.line, subagentTransformed.parsed));
   },

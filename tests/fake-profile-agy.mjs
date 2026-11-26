@@ -91,7 +91,7 @@ const resolvedGeminiDir = resolve(baseHome, geminiFlag);
 const resolvedAppDataDir = resolve(resolvedGeminiDir, appDataFlag);
 const sessionsFile = join(resolvedAppDataDir, 'sessions.json');
 const bootAccount = readSyntheticAccount(resolvedAppDataDir);
-logInvocation({ mode: 'acp', accountId: bootAccount?.accountId ?? null, args });
+logInvocation({ mode: 'acp', accountId: bootAccount?.accountId ?? null, args, pid: process.pid });
 
 function loadSessions() {
   if (!existsSync(sessionsFile)) return {};
@@ -108,9 +108,17 @@ const reply = (id, result) => send({ jsonrpc: '2.0', id, result });
 const replyError = (id, message) => send({ jsonrpc: '2.0', id, error: { code: -32000, message } });
 
 const resumedSessions = new Set();
+let waitingPrompt;
 
 createInterface({ input: process.stdin }).on('line', line => {
   const m = JSON.parse(line);
+  if (m.method === 'session/cancel' && waitingPrompt) {
+    const { id, rejectSteer } = waitingPrompt;
+    waitingPrompt = undefined;
+    if (rejectSteer) replyError(id, 'Simulated failed prompt during steering');
+    else reply(id, { stopReason: 'cancelled' });
+    return;
+  }
   if (m.method === 'initialize') {
     reply(m.id, {
       protocolVersion: 1,
@@ -154,6 +162,11 @@ createInterface({ input: process.stdin }).on('line', line => {
       return;
     }
     logInvocation({ mode: 'prompt', accountId: account.accountId });
+    const waitForSteer = m.params.prompt.find(part => part.text?.startsWith('wait-for-steer'));
+    if (waitForSteer) {
+      waitingPrompt = { id: m.id, rejectSteer: waitForSteer.text === 'wait-for-steer-error' };
+      return;
+    }
     if (m.params.prompt.some(part => part.text === 'hold')) {
       send({
         jsonrpc: '2.0',
