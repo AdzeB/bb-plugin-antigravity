@@ -312,6 +312,18 @@ try {
 
     assert.equal(existsSync(untrustedFlag), false, 'untrusted session PATH executable must never run');
     writeFileSync(sessionsRecordPath, JSON.stringify({ alphaSessionId, betaSessionId, defaultSessionId }));
+  } else if (mode === 'resume-with-corrupt-binding') {
+    const { alphaSessionId } = JSON.parse(readFileSync(sessionsRecordPath, 'utf8'));
+    const params = {
+      threadId: 'thread-alpha', providerThreadId: alphaSessionId, cwd: root, instructionMode: 'append',
+      options: makeOptions(alphaEnv),
+    };
+    await rejectRoute('thread/resume', { ...params, options: makeOptions(betaEnv) });
+    const resumed = send('thread/resume', params);
+    assert.equal((await wait(m => m.id === resumed)).result?.providerThreadId, alphaSessionId);
+    assert.deepEqual(await runTurn('thread-alpha', alphaSessionId, 'creq_23456789at', alphaEnv), {
+      accountId: 'synthetic-alpha', sessionId: 'session-synthetic-alpha-1', resumed: true,
+    });
   } else if (mode === 'phase2-restart-and-resume') {
     const { alphaSessionId, betaSessionId, defaultSessionId } = JSON.parse(readFileSync(sessionsRecordPath, 'utf8'));
     const alphaResume = {

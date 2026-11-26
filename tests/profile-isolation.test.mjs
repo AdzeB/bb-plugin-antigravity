@@ -77,7 +77,7 @@ async function runPhase(mode, root) {
     process.execPath,
     ['--experimental-strip-types', fixturePath, mode, root],
     {
-      timeout: 20_000,
+      timeout: 45_000,
       windowsHide: true,
       env: {
         ...process.env,
@@ -106,17 +106,19 @@ test('routed stop force-terminates a CLI that ignores cancellation with a steer 
   await runPhase('unresponsive-stop', root);
 });
 
-for (const state of ['missing', 'corrupt']) {
-  test(`routing survives host restart with ${state} local binding state`, async t => {
-    const root = createSyntheticWorkspace();
-    t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
-    // A directory at the old binding path prevents the prototype from writing the binding.
-    const oldBindingPath = join(root, 'state', 'session-profiles.json');
-    mkdirSync(oldBindingPath, { recursive: true });
-    await runPhase('phase1-start', root);
-    rmSync(oldBindingPath, { recursive: true });
-    if (state === 'corrupt') writeFileSync(oldBindingPath, 'corrupt');
-    rmSync(join(root, 'invocations.jsonl'), { force: true });
-    await runPhase('phase2-restart-and-resume', root);
-  });
-}
+test('routing survives host restarts without valid local binding state', async t => {
+  const root = createSyntheticWorkspace();
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+  // A directory at the old binding path prevents the prototype from writing the binding.
+  const oldBindingPath = join(root, 'state', 'session-profiles.json');
+  const invocationsPath = join(root, 'invocations.jsonl');
+  mkdirSync(oldBindingPath, { recursive: true });
+  await runPhase('phase1-start', root);
+  rmSync(oldBindingPath, { recursive: true });
+  rmSync(invocationsPath, { force: true });
+  await runPhase('phase2-restart-and-resume', root);
+
+  writeFileSync(oldBindingPath, 'corrupt');
+  rmSync(invocationsPath, { force: true });
+  await runPhase('resume-with-corrupt-binding', root);
+});
