@@ -100,6 +100,12 @@ test('unresolved host agy fails with an installation diagnostic and never uses s
   }
 });
 
+test('routed stop force-terminates a CLI that ignores cancellation with a steer queued', async t => {
+  const root = createSyntheticWorkspace();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  await runPhase('unresponsive-stop', root);
+});
+
 for (const state of ['missing', 'corrupt']) {
   test(`routing survives host restart with ${state} local binding state`, async t => {
     const root = createSyntheticWorkspace();

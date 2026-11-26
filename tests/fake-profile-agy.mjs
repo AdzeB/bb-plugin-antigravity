@@ -113,9 +113,11 @@ let waitingPrompt;
 createInterface({ input: process.stdin }).on('line', line => {
   const m = JSON.parse(line);
   if (m.method === 'session/cancel' && waitingPrompt) {
-    const { id, rejectSteer } = waitingPrompt;
+    const { id, mode } = waitingPrompt;
+    logInvocation({ mode: 'cancel', promptMode: mode });
+    if (mode === 'wait-for-steer-ignore') return;
     waitingPrompt = undefined;
-    if (rejectSteer) replyError(id, 'Simulated failed prompt during steering');
+    if (mode === 'wait-for-steer-error') replyError(id, 'Simulated failed prompt during steering');
     else reply(id, { stopReason: 'cancelled' });
     return;
   }
@@ -164,7 +166,16 @@ createInterface({ input: process.stdin }).on('line', line => {
     logInvocation({ mode: 'prompt', accountId: account.accountId });
     const waitForSteer = m.params.prompt.find(part => part.text?.startsWith('wait-for-steer'));
     if (waitForSteer) {
-      waitingPrompt = { id: m.id, rejectSteer: waitForSteer.text === 'wait-for-steer-error' };
+      waitingPrompt = { id: m.id, mode: waitForSteer.text };
+      if (waitForSteer.text === 'wait-for-steer-rebuild') {
+        send({
+          jsonrpc: '2.0', method: 'session/update',
+          params: {
+            sessionId,
+            update: { sessionUpdate: 'tool_call', toolCallId: 'synthetic-steer-call', title: 'Synthetic tool', kind: 'other', status: 'in_progress' },
+          },
+        });
+      }
       return;
     }
     if (m.params.prompt.some(part => part.text === 'hold')) {

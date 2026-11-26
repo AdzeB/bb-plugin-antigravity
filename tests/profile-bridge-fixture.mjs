@@ -25,13 +25,16 @@ const { backgroundTaskTracker, experimental_providerBridge: bridge } = await imp
 
 const originalWrite = process.stdout.write.bind(process.stdout);
 const messages = [];
+let onOutput;
 let pending = '';
 process.stdout.write = chunk => {
   pending += String(chunk);
   let end;
   while ((end = pending.indexOf('\n')) >= 0) {
-    messages.push(JSON.parse(pending.slice(0, end)));
+    const message = JSON.parse(pending.slice(0, end));
     pending = pending.slice(end + 1);
+    messages.push(message);
+    onOutput?.(message);
   }
   return true;
 };
@@ -129,39 +132,52 @@ async function rejectRoute(method, params) {
   assert.equal(readInvocations().length, before, 'profile rejection must happen before invoking agy');
 }
 
-async function stopQueuedSteer(threadId, envVars, rejectSteer) {
+async function stopQueuedSteer(threadId, envVars, mode, enabled = true) {
   const opening = send('thread/start', {
-    threadId, cwd: root, instructionMode: 'append', options: makeOptions(envVars),
+    threadId, cwd: root, instructionMode: 'append', options: makeOptions(envVars, undefined, enabled),
   });
   const providerThreadId = (await wait(m => m.id === opening)).result?.providerThreadId;
-  assert.match(providerThreadId, /^antigravity-profile:/);
+  assert.match(providerThreadId, enabled ? /^antigravity-profile:/ : /^session-synthetic-default-/);
   const turn = send('turn/start', {
     threadId, providerThreadId, clientRequestId: 'creq_23456789ar',
-    input: [{ type: 'text', text: rejectSteer ? 'wait-for-steer-error' : 'wait-for-steer' }],
-    options: makeOptions(envVars),
+    input: [{ type: 'text', text: `wait-for-steer-${mode}` }],
+    options: makeOptions(envVars, undefined, enabled),
   });
   assert.equal((await wait(m => m.id === turn)).error, undefined);
 
   const clientRequestId = 'creq_23456789as';
+  let stop;
+  const sendStop = () => {
+    stop = send('thread/stop', { threadId, providerThreadId, intent: 'interrupt', activeTurnId: 'turn-1' });
+  };
+  if (mode === 'rebuild') {
+    // Draining this tool marks the transition into the queued steer before the SDK stops the old process.
+    onOutput = m => {
+      if (m.method !== 'thread/delta' || m.params.threadId !== threadId ||
+          !m.params.deltas.some(d => d.kind === 'item.close' && d.status === 'interrupted')) return;
+      onOutput = undefined;
+      queueMicrotask(sendStop);
+    };
+  }
   const steer = send('turn/steer', {
     threadId, providerThreadId, expectedTurnId: 'turn-1', clientRequestId,
     input: [{ type: 'text', text: 'identify' }],
-    options: makeOptions({ ...envVars, SYNTHETIC_REBUILD: '1' }),
+    options: makeOptions({ ...envVars, SYNTHETIC_REBUILD: '1' }, undefined, enabled),
   });
-  const stop = send('thread/stop', { threadId, providerThreadId, intent: 'release', activeTurnId: null });
+  if (mode !== 'rebuild') sendStop();
   const queued = await wait(m => m.id === steer);
   assert.deepEqual(queued.result, { threadId });
-  const stopped = await wait(m => m.id === stop);
+  const stopped = await wait(m => stop !== undefined && m.id === stop);
   assert.equal(stopped.result?.ok, true);
   const settling = messages.slice(messages.indexOf(queued) + 1, messages.indexOf(stopped));
-  if (rejectSteer) {
-    assert.ok(settling.some(m => m.method === 'error' && m.params.threadId === threadId), 'SDK failure must release the deferred stop');
-  } else {
-    assert.ok(settling.some(m => m.method === 'thread/delta' && m.params.threadId === threadId &&
-      m.params.deltas.some(d => d.kind === 'input.accepted' && d.clientRequestId === clientRequestId)),
-    'queued steer must reach the replacement before stop is acknowledged');
-  }
+  assert.equal(settling.some(m => m.method === 'thread/delta' && m.params.threadId === threadId &&
+    m.params.deltas.some(d => d.kind === 'input.accepted' && d.clientRequestId === clientRequestId)),
+  mode === 'rebuild', 'only a steer already in a rebuild may reach ACP before stop is acknowledged');
   assert.ok(!settling.some(m => m.params?.threadId === threadId && ['thread/identity', 'session/replaced'].includes(m.method)));
+  assert.ok(readInvocations().some(entry => entry.mode === 'cancel' && entry.promptMode === `wait-for-steer-${mode}`));
+  const account = enabled ? 'synthetic-alpha' : 'synthetic-default';
+  const finalProcess = readInvocations().findLast(entry => entry.mode === 'acp' && entry.accountId === account);
+  assert.throws(() => process.kill(finalProcess.pid, 0), { code: 'ESRCH' }, 'stop must kill the process before acknowledging');
 }
 
 const alphaEnv = {
@@ -213,6 +229,9 @@ try {
 
     assert.equal(existsSync(untrustedFlag), false, 'untrusted session PATH executable must never run');
     assert.deepEqual(readInvocations(), []);
+  } else if (mode === 'unresponsive-stop') {
+    await stopQueuedSteer('thread-steer-unresponsive', alphaEnv, 'ignore');
+    await stopQueuedSteer('thread-default-steer-stop', {}, 'error', false);
   } else if (mode === 'phase1-start') {
     const startAlphaId = send('thread/start', {
       threadId: 'thread-alpha',
@@ -444,8 +463,8 @@ try {
     const defaultReplacement = await wait(m => m.method === 'session/replaced' && m.params.threadId === 'thread-default');
     assert.equal(defaultReplacement.params.providerThreadId, rebuiltDefault.sessionId);
 
-    await stopQueuedSteer('thread-steer-rebuild', alphaEnv, false);
-    await stopQueuedSteer('thread-steer-error', alphaEnv, true);
+    await stopQueuedSteer('thread-steer-rebuild', alphaEnv, 'rebuild');
+    await stopQueuedSteer('thread-steer-error', alphaEnv, 'error');
 
     const turn = {
       threadId: 'thread-beta', providerThreadId: betaSessionId, clientRequestId: 'creq_23456789ah',

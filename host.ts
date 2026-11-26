@@ -108,7 +108,13 @@ type SessionIdentity = { profileHash?: string; sessionId: string };
 const pendingIdentities = new Map<string | number, PendingIdentity>();
 const activeIdentities = new Map<string, SessionIdentity>();
 const pendingInputs = new Map<string | number, { threadId: string; clientRequestId: string; steer: boolean }>();
-const deferredStops = new Map<string, string>();
+type ClosingSession = {
+  id: string | number;
+  line: string;
+  pastEarlyAck: boolean;
+  phase: "first-stop" | "waiting-for-input" | "final-stop";
+};
+const closingSessions = new Map<string, ClosingSession>();
 
 function pendingIdentityForThread(threadId: string): PendingIdentity | undefined {
   for (const pending of pendingIdentities.values()) {
@@ -120,19 +126,21 @@ function profileError(message: string) {
   return { code: -32000, message };
 }
 
-function hasPendingSessionWork(threadId: string): boolean {
-  return pendingIdentityForThread(threadId)?.profileHash !== undefined ||
+function hasPendingRoutedWork(threadId: string): boolean {
+  return [...pendingIdentities.values()].some(request =>
+    request.threadId === threadId && !request.stop && request.profileHash !== undefined) ||
     [...pendingInputs.values()].some(input => input.threadId === threadId);
 }
 
-function flushDeferredStop(threadId: string): void {
-  const line = deferredStops.get(threadId);
-  if (line === undefined || hasPendingSessionWork(threadId)) return;
+function finishClosingSession(threadId: string): void {
+  const closing = closingSessions.get(threadId);
+  if (closing?.phase !== "waiting-for-input" || hasPendingRoutedWork(threadId)) return;
   // SDK output is synchronous. Let the current SDK operation finish before forwarding stop.
   queueMicrotask(() => {
-    if (deferredStops.get(threadId) !== line || hasPendingSessionWork(threadId)) return;
-    deferredStops.delete(threadId);
-    experimental_providerBridge.handleLine(line);
+    if (closing.phase !== "waiting-for-input" || hasPendingRoutedWork(threadId)) return;
+    closing.phase = "final-stop";
+    pendingIdentities.set(closing.id, { threadId, stop: true });
+    experimental_acpProviderBridge.handleLine(closing.line);
   });
 }
 
@@ -141,7 +149,7 @@ function settlePendingInputs(message: any): void {
     const input = pendingInputs.get(message.id);
     if (input && (!input.steer || message.error)) {
       pendingInputs.delete(message.id);
-      flushDeferredStop(input.threadId);
+      finishClosingSession(input.threadId);
     }
     return;
   }
@@ -157,7 +165,7 @@ function settlePendingInputs(message: any): void {
       pendingInputs.delete(id);
     }
   }
-  flushDeferredStop(threadId);
+  finishClosingSession(threadId);
 }
 
 function wrapProfileSessionIds(line: string): string | null {
@@ -171,11 +179,25 @@ function wrapProfileSessionIds(line: string): string | null {
     if (!pending) return line;
     pendingIdentities.delete(message.id);
     const { threadId, profileHash, stop } = pending;
-    flushDeferredStop(threadId);
     if (stop) {
+      const closing = closingSessions.get(threadId);
+      if (closing?.phase === "first-stop" && message.result?.ok === true) {
+        if (closing.pastEarlyAck) {
+          // The SDK reached a session and dropped its queue before awaiting process exit.
+          // Dropped steers have no completion notification.
+          for (const [id, input] of pendingInputs) {
+            if (input.threadId === threadId && input.steer) pendingInputs.delete(id);
+          }
+        }
+        closing.phase = "waiting-for-input";
+        finishClosingSession(threadId);
+        return null;
+      }
+      closingSessions.delete(threadId);
       if (message.result?.ok === true) activeIdentities.delete(threadId);
       return line;
     }
+    finishClosingSession(threadId);
     if (message.error) return line;
     const sessionId = message.result?.providerThreadId;
     if (typeof sessionId !== "string" || !sessionId) {
@@ -194,7 +216,7 @@ function wrapProfileSessionIds(line: string): string | null {
   const pending = pendingIdentityForThread(threadId);
   if (!active && (!pending || pending.stop)) return null;
   if (message.method === "thread/identity" || message.method === "session/replaced") {
-    if (deferredStops.has(threadId) || pending?.stop) return null;
+    if (closingSessions.has(threadId) || pending?.stop) return null;
   }
   const profileHash = active?.profileHash ?? pending?.profileHash;
   // BB persists this SDK notification when a process rebuild changes the native session ID.
@@ -212,7 +234,7 @@ function guardProfileSession(request: Record<string, any> | null): string | unde
   const id = request?.jsonrpc === "2.0" && (typeof request.id === "string" || typeof request.id === "number")
     ? request.id : undefined;
   if (method === "thread/fork") return "Antigravity does not support forking threads.";
-  if ((deferredStops.has(threadId) || pendingIdentityForThread(threadId)?.stop) && method !== "thread/discard") {
+  if ((closingSessions.has(threadId) || pendingIdentityForThread(threadId)?.stop) && method !== "thread/discard") {
     return "Antigravity is stopping this session. Try again when it has stopped.";
   }
 
@@ -382,17 +404,6 @@ export const experimental_providerBridge = {
       return;
     }
 
-    const threadId = request?.params?.threadId;
-    if (request?.method === "thread/stop" && request.jsonrpc === "2.0" &&
-        (typeof request.id === "string" || typeof request.id === "number") &&
-        typeof threadId === "string" && !deferredStops.has(threadId) &&
-        !pendingIdentityForThread(threadId)?.stop && hasPendingSessionWork(threadId)) {
-      // The SDK can acknowledge a second stop on the old process while a replacement is
-      // between processes. Send stop only after all forwarded input/setup has settled.
-      deferredStops.set(threadId, line);
-      return;
-    }
-
     // A held steer becomes turn/start with the same session reference and execution options.
     const profileRejection = guardProfileSession(request);
     if (profileRejection) {
@@ -459,6 +470,19 @@ export const experimental_providerBridge = {
         steer: forwarded.method === "turn/steer",
       });
     }
-    experimental_acpProviderBridge.handleLine(mapPromptMode(subagentTransformed.line, subagentTransformed.parsed));
+    const forwardedLine = mapPromptMode(subagentTransformed.line, subagentTransformed.parsed);
+    const threadId = forwarded?.params?.threadId;
+    if (forwarded?.method === "thread/stop" && typeof threadId === "string" &&
+        (typeof forwarded.id === "string" || typeof forwarded.id === "number") && hasPendingRoutedWork(threadId)) {
+      const closing: ClosingSession = { id: forwarded.id, line: forwardedLine, pastEarlyAck: false, phase: "first-stop" };
+      closingSessions.set(threadId, closing);
+      // In SDK 0.6.178, stop with no session replies inline. An already stopping session
+      // replies after one await. A stop that takes ownership awaits connection.kill first.
+      // Keep the early acknowledgement fenced until the original input/setup settles.
+      experimental_acpProviderBridge.handleLine(forwardedLine);
+      queueMicrotask(() => { closing.pastEarlyAck = true; });
+      return;
+    }
+    experimental_acpProviderBridge.handleLine(forwardedLine);
   },
 };
