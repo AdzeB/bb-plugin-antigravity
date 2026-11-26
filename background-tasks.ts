@@ -1,4 +1,5 @@
-import { openSync, closeSync, fstatSync, readSync, statSync, readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { openSync, closeSync, fstatSync, readSync, statSync, readFileSync, readdirSync, writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { StringDecoder } from 'node:string_decoder';
@@ -6,12 +7,18 @@ import { inferAntigravityToolName } from './dialect.ts';
 
 export interface RecordedToolEvent {
   toolCallId: string;
+  name?: string;
   title?: string;
   kind?: string;
   status?: string;
   rawInput?: Record<string, unknown>;
   rawOutput?: unknown;
   content?: unknown;
+}
+interface RetainedToolEvent extends RecordedToolEvent {
+  outputTruncated?: boolean;
+  taskStatusFromOutput?: ReturnType<typeof parseTaskStatus>;
+  commandFailed?: boolean;
 }
 export interface BackgroundTask {
   taskId: string;
@@ -68,7 +75,32 @@ export type TrackerDelta = BackgroundTaskDelta | SilentTurnInjectionDelta | Turn
 export const DEFAULT_HOLD_SETTLE_GRACE_MS = 20_000;
 /** Default upper bound on how long one turn can be held open for background work. */
 export const DEFAULT_MAX_TURN_HOLD_MS = 5 * 60 * 1000;
+/** Default maximum bytes read from one transcript watcher in a single poll slice. */
+export const DEFAULT_MAX_TRANSCRIPT_READ_BYTES = 64 * 1024;
+/** Default maximum characters buffered for one transcript line before bounded streaming scan. */
+export const DEFAULT_MAX_TRANSCRIPT_LINE_CHARS = 128 * 1024;
+/** Default maximum characters retained for tool output and task completion summaries. */
+export const DEFAULT_MAX_RETAINED_TOOL_OUTPUT_CHARS = 16 * 1024;
+/** Default maximum in-flight tool records retained per thread. */
+export const DEFAULT_MAX_RETAINED_TOOLS_PER_THREAD = 256;
+/** Default maximum unconsumed tool events retained in the pending correlation queue. */
+export const DEFAULT_MAX_PENDING_TOOL_EVENTS = 512;
+/** Default maximum characters buffered per thread for streamed text completion scanning. */
+export const DEFAULT_MAX_STREAM_BUFFER_CHARS = 64 * 1024;
+const MAX_RETAINED_INPUT_STRING_CHARS = 2048;
+const MAX_RETAINED_CONVERSATION_IDS = 256;
+const MAX_COMPLETION_OVERLAP_CHARS = 4096;
+const RETAINED_INPUT_STRING_KEYS = [
+  'Action', 'TaskId', 'Role', 'TypeName', 'toolSummary', 'CommandLine', 'command', 'Prompt', 'CronExpression',
+] as const;
 const TERMINAL_TOOL_STATUS = /^(?:completed|failed|cancell?ed)$/;
+const COMPLETION_HINT = /Task id|Subagent/i;
+const TASK_ANNOUNCEMENT_RE = /Task id "([^"]+)" (finished with result:|was canceled|was killed|terminated|failed)/gi;
+const SUBAGENT_IDLE_RE = /Subagent ([^\s"]+) has gone idle/gi;
+const RESULT_FAILED_RE = /Command exited with code ([1-9]\d*)|Encountered error/i;
+const RESULT_KILLED_RE = /Step was canceled/i;
+const FLAG_TAIL_CHARS = 64;
+const TRUNCATION_MARKER = '\n...[truncated]...\n';
 // After this many consecutive silent turns (failed empty-output command, no agent text),
 // the injected message escalates to "command execution appears broken in this session".
 export const SILENT_TURN_ESCALATION_THRESHOLD = 2;
@@ -99,15 +131,210 @@ function containsTaskToken(text: string, token: string): boolean {
   return new RegExp(`(?<![A-Za-z0-9_/-])${escaped}(?![A-Za-z0-9_/-])`).test(text);
 }
 
-function mergeToolEvent(previous: RecordedToolEvent | undefined, event: RecordedToolEvent): RecordedToolEvent {
+function sliceHeadSafe(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  let end = maxLen;
+  if (end > 0 && text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff) end -= 1;
+  return text.slice(0, end);
+}
+
+function sliceTailSafe(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  let start = text.length - maxLen;
+  if (start < text.length && text.charCodeAt(start) >= 0xdc00 && text.charCodeAt(start) <= 0xdfff) start += 1;
+  return text.slice(start);
+}
+
+function boundText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  if (maxChars <= TRUNCATION_MARKER.length + 2) return sliceHeadSafe(text, maxChars);
+  const budget = maxChars - TRUNCATION_MARKER.length;
+  const head = Math.ceil(budget / 2);
+  const tail = budget - head;
+  return `${sliceHeadSafe(text, head)}${TRUNCATION_MARKER}${sliceTailSafe(text, tail)}`;
+}
+
+// "message" also appears in legacy transcript records.
+const TRANSCRIPT_TEXT_KEYS = new Set(['text', 'content', 'output', 'message']);
+const JSON_ARRAY_START = /^(?:["{\[\]]|(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d*)?(?:[eE][+-]?\d*)?|-)(?=[ \t\r,\]]|$))/;
+
+function extractTranscriptText(value: unknown): string {
+  const strings: string[] = [];
+  const pending = [value];
+  while (pending.length) {
+    const part = pending.pop();
+    if (typeof part === 'string') {
+      if (part) strings.push(part);
+    } else if (Array.isArray(part)) {
+      for (let i = part.length - 1; i >= 0; i -= 1) pending.push(part[i]);
+    } else if (part && typeof part === 'object') {
+      for (const [key, entry] of Object.entries(part).reverse()) {
+        if (TRANSCRIPT_TEXT_KEYS.has(key)) pending.push(entry);
+      }
+    }
+  }
+  return strings.join('\n');
+}
+
+interface TranscriptJsonState {
+  frames: { object: boolean; expectKey: boolean; selectValue: boolean }[];
+  skipDepth: number;
+  string?: 'key' | 'text-start' | 'text' | 'skip';
+  key: string;
+  escape: string;
+  hasText: boolean;
+  done: boolean;
+  invalid: boolean;
+}
+
+function readTranscriptJson(state: TranscriptJsonState, raw: string, maxDepth: number): string {
+  const input = state.escape + raw;
+  state.escape = '';
+  const stringToken = /[^"\\\x00-\x1f]+|\\(?:["\\/bfnrt]|u[\da-fA-F]{4})|"/y;
+  const unselectedToken = /[^"[\]{},]+/y;
+  let text = '';
+  let pos = 0;
+  while (pos < input.length && !state.invalid && !state.done) {
+    const frame = state.frames.at(-1);
+    const ch = input[pos];
+    if (state.string) {
+      stringToken.lastIndex = pos;
+      const token = stringToken.exec(input)?.[0];
+      if (!token) {
+        if (ch === '\\' && input.length - pos < 6) state.escape = input.slice(pos);
+        else state.invalid = true;
+        break;
+      }
+      pos = stringToken.lastIndex;
+      if (token === '"') {
+        if (state.string === 'key' && frame) frame.selectValue = TRANSCRIPT_TEXT_KEYS.has(state.key);
+        if (!frame && !state.skipDepth) state.done = true;
+        state.string = undefined;
+      } else if (state.string !== 'skip') {
+        const decoded: string = ch === '\\' ? JSON.parse('"' + token + '"') : token;
+        if (state.string === 'key') {
+          // The longest selectable key is "content".
+          if (state.key.length + decoded.length <= 7) state.key += decoded;
+          else state.string = 'skip';
+        } else {
+          if (state.string === 'text-start' && state.hasText) text += '\n';
+          text += decoded;
+          state.string = 'text';
+          state.hasText = true;
+        }
+      }
+      continue;
+    }
+
+    const selected = !state.skipDepth && (!frame || frame.selectValue);
+    pos += 1;
+    if (ch === '"') {
+      if (!state.skipDepth && frame?.expectKey) {
+        frame.expectKey = false;
+        frame.selectValue = false;
+        state.key = '';
+        state.string = 'key';
+      } else {
+        state.string = selected ? 'text-start' : 'skip';
+      }
+    } else if (ch === '{' || ch === '[') {
+      // Track ignored subtrees by depth alone, including metadata nested inside message text.
+      if (!selected || state.frames.length >= maxDepth) {
+        state.skipDepth += 1;
+      } else {
+        const object = ch === '{';
+        state.frames.push({ object, expectKey: object, selectValue: !object });
+      }
+    } else if (ch === '}' || ch === ']') {
+      if (state.skipDepth) state.skipDepth -= 1;
+      else if (frame?.object === (ch === '}')) state.frames.pop();
+      else state.invalid = true;
+      if (!state.frames.length && !state.skipDepth) state.done = true;
+    } else if (ch === ',') {
+      if (!state.skipDepth && frame?.object) {
+        frame.expectKey = true;
+        frame.selectValue = false;
+      }
+    } else {
+      unselectedToken.lastIndex = pos - 1;
+      unselectedToken.exec(input);
+      pos = unselectedToken.lastIndex;
+    }
+  }
+  return text;
+}
+
+function compactRawInput(rawInput: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!rawInput || typeof rawInput !== 'object' || Array.isArray(rawInput)) return undefined;
+  const compact: Record<string, unknown> = {};
+  for (const key of RETAINED_INPUT_STRING_KEYS) {
+    const value = rawInput[key];
+    if (typeof value === 'string') compact[key] = boundText(value, MAX_RETAINED_INPUT_STRING_CHARS);
+  }
+  if (typeof rawInput.IsDaemon === 'boolean' || typeof rawInput.IsDaemon === 'string') compact.IsDaemon = rawInput.IsDaemon;
+  if (typeof rawInput.DurationSeconds === 'number' && Number.isFinite(rawInput.DurationSeconds)) compact.DurationSeconds = rawInput.DurationSeconds;
+  if (Array.isArray(rawInput.ConversationIds)) {
+    compact.ConversationIds = rawInput.ConversationIds
+      .filter((item): item is string => typeof item === 'string')
+      .slice(0, MAX_RETAINED_CONVERSATION_IDS)
+      .map(item => boundText(item, MAX_RETAINED_INPUT_STRING_CHARS));
+  }
+  return Object.keys(compact).length ? compact : undefined;
+}
+
+function parseTaskStatus(text: string): 'running' | 'failed' | 'interrupted' | 'completed' | undefined {
+  if (/Step is still running|status\s*[:=]\s*RUNNING/i.test(text)) return 'running';
+  if (!/Command exited with code \d+|SCHEDULE_FINISHED|Step was canceled|status\s*[:=]\s*(?:DONE|CANCELED|ERROR|COMPLETED|FAILED|KILLED|STOPPED)|not running|not found|unknown task|finished with result/i.test(text)) return undefined;
+  if (/Command exited with code [1-9]\d*|ERROR|FAILED/i.test(text)) return 'failed';
+  if (/CANCELED|KILLED|interrupted/i.test(text)) return 'interrupted';
+  return 'completed';
+}
+
+function compactToolEvent(event: RetainedToolEvent, maxOutputChars: number): RetainedToolEvent {
+  const inferred = inferAntigravityToolName(event as any) ?? undefined;
+  const hasOutput = event.content !== undefined || event.rawOutput !== undefined;
+  const extracted = hasOutput ? extractToolOutputText(event) : undefined;
+  const outputTruncated = Boolean((event as RetainedToolEvent).outputTruncated || (extracted !== undefined && extracted.length > maxOutputChars));
+  const boundedContent = extracted !== undefined ? boundText(extracted, maxOutputChars) : undefined;
+  let compactOutput: unknown = undefined;
+  if (Array.isArray(event.rawOutput) && event.rawOutput.length === 0) {
+    compactOutput = [];
+  } else if (event.rawOutput && typeof event.rawOutput === 'object' && !Array.isArray(event.rawOutput)) {
+    const conversationId = (event.rawOutput as Record<string, unknown>).conversationId;
+    if (typeof conversationId === 'string') compactOutput = { conversationId: boundText(conversationId, MAX_RETAINED_INPUT_STRING_CHARS) };
+  }
+  const rawInput = compactRawInput(event.rawInput);
+  return {
+    toolCallId: event.toolCallId,
+    ...(inferred ? { name: inferred } : typeof event.name === 'string' ? { name: boundText(event.name, MAX_RETAINED_INPUT_STRING_CHARS) } : {}),
+    ...(typeof event.title === 'string' ? { title: boundText(event.title, MAX_RETAINED_INPUT_STRING_CHARS) } : {}),
+    ...(typeof event.kind === 'string' ? { kind: event.kind } : {}),
+    ...(typeof event.status === 'string' ? { status: event.status } : {}),
+    ...(rawInput ? { rawInput } : {}),
+    ...(boundedContent !== undefined ? { content: boundedContent } : {}),
+    ...(compactOutput !== undefined ? { rawOutput: compactOutput } : {}),
+    ...(outputTruncated ? {
+      outputTruncated: true,
+      taskStatusFromOutput: event.outputTruncated ? event.taskStatusFromOutput : parseTaskStatus(extracted ?? ''),
+      commandFailed: event.outputTruncated ? event.commandFailed : /command exited with code [1-9]\d*/i.test(extracted ?? ''),
+    } : {}),
+  };
+}
+
+function mergeToolEvent(previous: RetainedToolEvent | undefined, event: RetainedToolEvent): RetainedToolEvent {
+  const hasNewOutput = event.content !== undefined || event.rawOutput !== undefined;
   return {
     ...previous, ...event,
+    name: event.name ?? previous?.name,
     title: event.title ?? previous?.title,
     kind: event.kind ?? previous?.kind,
     status: event.status ?? previous?.status,
     rawInput: previous?.rawInput && event.rawInput ? { ...previous.rawInput, ...event.rawInput } : event.rawInput ?? previous?.rawInput,
     rawOutput: event.rawOutput ?? previous?.rawOutput,
     content: event.content ?? previous?.content,
+    taskStatusFromOutput: hasNewOutput ? event.taskStatusFromOutput : previous?.taskStatusFromOutput,
+    commandFailed: hasNewOutput ? event.commandFailed : previous?.commandFailed,
+    outputTruncated: hasNewOutput ? event.outputTruncated : previous?.outputTruncated,
   };
 }
 
@@ -123,23 +350,155 @@ export function defaultBackgroundTaskStatePath(): string {
   return join(dir, 'background-tasks.json');
 }
 
+const LOCK_MARKER_PATTERN = /^(\d+)-[0-9a-f-]+\.lock$/i;
+const LOCK_RETRY_BASE_MS = 10;
+const LOCK_RETRY_MAX_MS = 500;
+const TRANSIENT_IO_MAX_RETRIES = 20;
+
+export interface TaskStateFs {
+  openSync: typeof openSync;
+  closeSync: typeof closeSync;
+  statSync: typeof statSync;
+  readFileSync: typeof readFileSync;
+  readdirSync: typeof readdirSync;
+  writeFileSync: typeof writeFileSync;
+  renameSync: typeof renameSync;
+  mkdirSync: typeof mkdirSync;
+  unlinkSync: typeof unlinkSync;
+}
+
+const DEFAULT_TASK_STATE_FS: TaskStateFs = {
+  openSync, closeSync, statSync, readFileSync, readdirSync, writeFileSync, renameSync, mkdirSync, unlinkSync,
+};
+
+function isTransientFsError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return code === 'EPERM' || code === 'EACCES' || code === 'EBUSY';
+}
+
+function retryDelayMs(attempt: number): number {
+  const base = Math.min(LOCK_RETRY_MAX_MS, LOCK_RETRY_BASE_MS * (2 ** Math.min(attempt, 6)));
+  return base + Math.floor(Math.random() * base);
+}
+
+function isDirectoryPath(path: string, fsOps: TaskStateFs = DEFAULT_TASK_STATE_FS): boolean {
+  try {
+    return fsOps.statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function isPidDefinitivelyDead(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH';
+  }
+}
+
+function unlinkUniqueMarker(markerPath: string, fsOps: TaskStateFs = DEFAULT_TASK_STATE_FS, attempt = 0): void {
+  try {
+    fsOps.unlinkSync(markerPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return;
+    if (isTransientFsError(error) && attempt < TRANSIENT_IO_MAX_RETRIES) {
+      const timer = setTimeout(() => unlinkUniqueMarker(markerPath, fsOps, attempt + 1), retryDelayMs(attempt));
+      timer.unref?.();
+    }
+  }
+}
+
+/**
+ * Non-blocking cross-process lock around `background-tasks.json` using unique per-attempt
+ * markers in `<path>.locks/`. Each attempt creates `<pid>-<uuid>.lock` with `wx`, enumerates
+ * all markers before the critical section, prunes only definitively dead PIDs (`ESRCH`), and
+ * yields (removing only its own unique marker) if any other live contender exists. Live writers
+ * are never evicted by age, and unique marker names prevent shared-filename unlink races.
+ */
+export function withTaskStateLock<T>(
+  path: string,
+  fn: () => T,
+  fsOverrides?: Partial<TaskStateFs>,
+): { status: 'acquired'; value: T } | { status: 'contended' | 'transient' | 'error' } {
+  if (!path) return { status: 'error' };
+  const fsOps: TaskStateFs = fsOverrides ? { ...DEFAULT_TASK_STATE_FS, ...fsOverrides } : DEFAULT_TASK_STATE_FS;
+  const lockDir = `${path}.locks`;
+  const markerName = `${process.pid}-${randomUUID()}.lock`;
+  const markerPath = join(lockDir, markerName);
+  let markerCreated = false;
+  try {
+    fsOps.mkdirSync(lockDir, { recursive: true });
+    const fd = fsOps.openSync(markerPath, 'wx');
+    markerCreated = true;
+    fsOps.closeSync(fd);
+  } catch (error) {
+    if (markerCreated) unlinkUniqueMarker(markerPath, fsOps);
+    return isTransientFsError(error) ? { status: 'transient' } : { status: 'error' };
+  }
+  let entries: string[];
+  try {
+    entries = fsOps.readdirSync(lockDir);
+  } catch (error) {
+    unlinkUniqueMarker(markerPath, fsOps);
+    return isTransientFsError(error) ? { status: 'transient' } : { status: 'error' };
+  }
+  for (const entry of entries) {
+    if (entry === markerName) continue;
+    const match = LOCK_MARKER_PATTERN.exec(entry);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (isPidDefinitivelyDead(pid)) {
+      unlinkUniqueMarker(join(lockDir, entry), fsOps);
+      continue;
+    }
+    unlinkUniqueMarker(markerPath, fsOps);
+    return { status: 'contended' };
+  }
+  try {
+    return { status: 'acquired', value: fn() };
+  } finally {
+    unlinkUniqueMarker(markerPath, fsOps);
+  }
+}
+
+interface LoadedTaskState {
+  tasks: PersistedBackgroundTask[];
+  needsWrite: boolean;
+  ioError: 'none' | 'transient' | 'fatal';
+}
+
 /** Loads and validates the state file. Missing or corrupt files degrade to an empty list. */
-function readTaskState(path: string, maxAgeMs: number): PersistedBackgroundTask[] {
-  if (!path) return [];
+function loadTaskState(path: string, maxAgeMs: number, fsOps: TaskStateFs = DEFAULT_TASK_STATE_FS): LoadedTaskState {
+  if (!path) return { tasks: [], needsWrite: false, ioError: 'none' };
+  let raw: string;
+  try {
+    raw = fsOps.readFileSync(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { tasks: [], needsWrite: false, ioError: 'none' };
+    return { tasks: [], needsWrite: false, ioError: isTransientFsError(error) && !isDirectoryPath(path, fsOps) ? 'transient' : 'fatal' };
+  }
   let parsed: unknown;
-  try { parsed = JSON.parse(readFileSync(path, 'utf8')); } catch { return []; }
-  if (!parsed || typeof parsed !== 'object') return [];
+  try { parsed = JSON.parse(raw); } catch { return { tasks: [], needsWrite: true, ioError: 'none' }; }
+  if (!parsed || typeof parsed !== 'object') return { tasks: [], needsWrite: true, ioError: 'none' };
   const file = parsed as { version?: unknown; tasks?: unknown };
-  if (file.version !== 1 || !Array.isArray(file.tasks)) return [];
+  if (file.version !== 1 || !Array.isArray(file.tasks)) return { tasks: [], needsWrite: true, ioError: 'none' };
   const cutoff = Date.now() - Math.max(0, maxAgeMs); // Garbage-collect stale records.
   const records: PersistedBackgroundTask[] = [];
+  let pruned = false;
   for (const entry of file.tasks) {
-    if (!entry || typeof entry !== 'object') continue;
+    if (!entry || typeof entry !== 'object') { pruned = true; continue; }
     const task = entry as Partial<PersistedBackgroundTask>;
     if (typeof task.threadId !== 'string' || typeof task.taskId !== 'string' || typeof task.description !== 'string' ||
         typeof task.parentToolCallId !== 'string' || typeof task.startedAt !== 'number' ||
         !Number.isFinite(task.startedAt) || task.startedAt < cutoff ||
-        (task.taskType !== 'local_bash' && task.taskType !== 'local_subagent')) continue;
+        (task.taskType !== 'local_bash' && task.taskType !== 'local_subagent')) {
+      pruned = true;
+      continue;
+    }
     records.push({
       threadId: task.threadId, taskId: task.taskId, taskType: task.taskType, description: task.description,
       parentToolCallId: task.parentToolCallId, startedAt: task.startedAt,
@@ -147,21 +506,24 @@ function readTaskState(path: string, maxAgeMs: number): PersistedBackgroundTask[
       ...(typeof task.outputFile === 'string' ? { outputFile: task.outputFile } : {}),
     });
   }
-  return records;
+  return { tasks: records, needsWrite: pruned, ioError: 'none' };
 }
 
 /** Atomic-ish write: temp file + rename, so a crash mid-write can never corrupt the state file. */
-function writeTaskState(path: string, tasks: PersistedBackgroundTask[]): boolean {
+function writeTaskState(path: string, tasks: PersistedBackgroundTask[], fsOps: TaskStateFs = DEFAULT_TASK_STATE_FS): 'saved' | 'transient' | 'failed' {
+  let temp: string | undefined;
   try {
-    mkdirSync(dirname(path), { recursive: true });
-    const temp = `${path}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-    writeFileSync(temp, `${JSON.stringify({ version: 1, tasks } satisfies PersistedBackgroundTaskStateFile)}\n`);
-    renameSync(temp, path);
-    return true;
-  } catch {
+    fsOps.mkdirSync(dirname(path), { recursive: true });
+    temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    fsOps.writeFileSync(temp, `${JSON.stringify({ version: 1, tasks } satisfies PersistedBackgroundTaskStateFile)}\n`);
+    fsOps.renameSync(temp, path);
+    temp = undefined;
+    return 'saved';
+  } catch (error) {
     // Best effort: persistence trouble (missing dir permissions, full disk, ...) must never
     // crash the plugin host. Keep pending changes for the next save.
-    return false;
+    if (temp) { try { fsOps.unlinkSync(temp); } catch {} }
+    return isTransientFsError(error) && !isDirectoryPath(path, fsOps) ? 'transient' : 'failed';
   }
 }
 
@@ -171,23 +533,70 @@ export function createBackgroundTaskTracker(options: {
   /** Path of the persisted state file; omit to keep tracking in memory only (used by tests and the dev harness). */
   persistPath?: string;
   taskStateMaxAgeMs?: number;
+  /** Optional filesystem overrides for persisted task state and lock I/O (used by deterministic fault-injection tests). */
+  taskStateFs?: Partial<TaskStateFs>;
   /** Hold a completed turn open while non-daemon background work it started is still running (default true). */
   holdTurns?: boolean;
   /** How long to wait for the CLI's reactive follow-up turn once every blocking task settled. */
   holdSettleGraceMs?: number;
   /** Safety cap on a single hold; the held boundary is released when it expires. */
   maxTurnHoldMs?: number;
+  /** Maximum bytes read per transcript watcher in a single poll slice (default 64 KiB). */
+  maxTranscriptReadBytes?: number;
+  /** Maximum characters buffered for one transcript line before bounded streaming scan (default 128 KiB). */
+  maxTranscriptLineChars?: number;
+  /** Maximum characters retained for tool output and task completion summaries (default 16 KiB). */
+  maxRetainedToolOutputChars?: number;
+  /** Maximum in-flight tool records retained per thread (default 256). */
+  maxRetainedToolsPerThread?: number;
+  /** Maximum unconsumed tool events retained in the pending correlation queue (default 512). */
+  maxPendingToolEvents?: number;
+  /** Maximum characters buffered per thread for streamed text completion scanning (default 64 KiB). */
+  maxStreamBufferChars?: number;
 } = {}) {
+  interface PendingAnnouncement {
+    taskId: string;
+    failed: boolean;
+    killed: boolean;
+    summaryHead: string;
+    summaryTail: string;
+    truncated: boolean;
+    flagTail: string;
+  }
+  interface StreamingScanState {
+    buffer: string;
+    pending?: PendingAnnouncement;
+  }
+  interface TranscriptWatcherState {
+    plainScan?: StreamingScanState;
+    offset: number;
+    partial: string;
+    oversized?: { prefix: string; kind?: 'json' | 'plain'; json?: TranscriptJsonState; scan?: StreamingScanState };
+    decoder: StringDecoder;
+  }
   const threads = new Map<string, Map<string, BackgroundTask>>();
-  const pending = new Map<string, RecordedToolEvent[]>();
-  const threadTools = new Map<string, Map<string, RecordedToolEvent>>();
-  const streamBuffers = new Map<string, string>();
-  const watchers = new Map<string, Map<string, { offset: number; partial: string; decoder: StringDecoder }>>();
+  const pending = new Map<string, RetainedToolEvent[]>();
+  let pendingCount = 0;
+  const threadTools = new Map<string, Map<string, RetainedToolEvent>>();
+  const streamBuffers = new Map<string, StreamingScanState>();
+  const watchers = new Map<string, Map<string, TranscriptWatcherState>>();
   let timer: ReturnType<typeof setInterval> | undefined;
+  let catchUpTimer: ReturnType<typeof setImmediate> | undefined;
+  let readBuffer: Buffer | undefined;
   let disposed = false;
   const interval = options.pollIntervalMs ?? 500;
   const persistPath = options.persistPath || undefined;
   const maxAge = options.taskStateMaxAgeMs ?? DEFAULT_TASK_STATE_MAX_AGE_MS;
+  const fsOps: TaskStateFs = options.taskStateFs ? { ...DEFAULT_TASK_STATE_FS, ...options.taskStateFs } : DEFAULT_TASK_STATE_FS;
+  const trackerStartedAt = Date.now();
+  const maxReadBytes = Math.max(16, Math.floor(options.maxTranscriptReadBytes ?? DEFAULT_MAX_TRANSCRIPT_READ_BYTES));
+  const maxLineChars = Math.max(256, Math.floor(options.maxTranscriptLineChars ?? DEFAULT_MAX_TRANSCRIPT_LINE_CHARS));
+  const lineOverlap = Math.min(MAX_COMPLETION_OVERLAP_CHARS, Math.floor(maxLineChars / 2));
+  const maxToolOutputChars = Math.max(128, Math.floor(options.maxRetainedToolOutputChars ?? DEFAULT_MAX_RETAINED_TOOL_OUTPUT_CHARS));
+  const maxToolsPerThread = Math.max(1, Math.floor(options.maxRetainedToolsPerThread ?? DEFAULT_MAX_RETAINED_TOOLS_PER_THREAD));
+  const maxPendingEvents = Math.max(1, Math.floor(options.maxPendingToolEvents ?? DEFAULT_MAX_PENDING_TOOL_EVENTS));
+  const maxStreamChars = Math.max(256, Math.floor(options.maxStreamBufferChars ?? DEFAULT_MAX_STREAM_BUFFER_CHARS));
+  const streamOverlap = Math.min(MAX_COMPLETION_OVERLAP_CHARS, Math.floor(maxStreamChars / 2));
   const taskKey = (task: Pick<BackgroundTask, 'taskType' | 'taskId'>) => `${task.taskType === 'local_subagent' ? 'subagent' : 'task'}:${task.taskId}`;
   // Silent-turn detection state (issue: turn ends with no agent message after a failed
   // command with empty output, so BB records "No final output was recorded").
@@ -256,27 +665,179 @@ export function createBackgroundTaskTracker(options: {
     ...(task.outputFile ? { outputFile: task.outputFile } : {}),
   });
   const recordKey = (record: PersistedBackgroundTask) => JSON.stringify([record.threadId, taskKey(record)]);
-  const pendingWrites = new Map<string, { record: PersistedBackgroundTask; remove: boolean }>();
-  function persistTasks(thread: string, tasks: BackgroundTask[], remove: boolean) {
-    if (!persistPath) return;
+  const toInterruptedDelta = (record: PersistedBackgroundTask) => delta({
+    taskId: record.taskId, taskType: record.taskType, description: record.description, parentToolCallId: record.parentToolCallId,
+    ...(record.transcriptPath ? { transcriptPath: record.transcriptPath } : {}), ...(record.outputFile ? { outputFile: record.outputFile } : {}),
+  }, 'interrupted', 'stopped');
+  const pendingWrites = new Map<string, { record: PersistedBackgroundTask; remove: boolean; delayed: boolean; predecessorToolCallId?: string }>();
+  const pendingReconciliations = new Set<string>();
+  const localTouchedBeforeStartupLoad = new Set<string>();
+  const clearedBeforeStartupLoad = new Set<string>();
+  let persistRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let persistRetryAttempt = 0;
+  let transientRetryAttempt = 0;
+  let startupLoadPending = false;
+  let startupGcPending = false;
+  function hasPendingPersistenceWork(): boolean {
+    return pendingWrites.size > 0 || startupLoadPending || startupGcPending || pendingReconciliations.size > 0;
+  }
+  function clearPersistRetry() {
+    if (persistRetryTimer) { clearTimeout(persistRetryTimer); persistRetryTimer = undefined; }
+    persistRetryAttempt = 0;
+    transientRetryAttempt = 0;
+  }
+  function schedulePersistRetry() {
+    if (disposed || !persistPath || persistRetryTimer) return;
+    const delay = retryDelayMs(persistRetryAttempt);
+    persistRetryAttempt += 1;
+    persistRetryTimer = setTimeout(() => {
+      persistRetryTimer = undefined;
+      flushPendingWrites();
+    }, delay);
+    persistRetryTimer.unref?.();
+  }
+  function markPendingAddsDelayed() {
+    for (const change of pendingWrites.values()) {
+      if (!change.remove) change.delayed = true;
+    }
+  }
+  function clearInitialRecordsForThread(thread: string) {
+    for (const [key, record] of initialRecords) {
+      if (record.threadId === thread) initialRecords.delete(key);
+    }
+  }
+  function matchingInitialRecords(thread: string, records: PersistedBackgroundTask[]): PersistedBackgroundTask[] {
+    const active = threads.get(thread);
+    return records.filter(record => {
+      const initial = initialRecords.get(recordKey(record));
+      return record.threadId === thread && !active?.has(taskKey(record)) &&
+        initial?.startedAt === record.startedAt && initial.parentToolCallId === record.parentToolCallId;
+    });
+  }
+  function queuePendingWrites(thread: string, tasks: BackgroundTask[], remove: boolean) {
     for (const task of tasks) {
       const record = toRecord(thread, task);
       const key = recordKey(record);
-      pendingWrites.set(JSON.stringify([key, record.startedAt, record.parentToolCallId]), { record, remove });
+      pendingWrites.set(JSON.stringify([key, record.startedAt, record.parentToolCallId]), { record, remove, delayed: false });
       initialRecords.delete(key);
+      if (startupLoadPending) localTouchedBeforeStartupLoad.add(key);
     }
-    if (!pendingWrites.size) return;
-    const records = new Map(readTaskState(persistPath, maxAge).map(record => [recordKey(record), record]));
+  }
+  function populateInitialRecords(tasks: PersistedBackgroundTask[], fromDelayedStartup: boolean) {
+    for (const record of tasks) {
+      if (fromDelayedStartup && record.startedAt > trackerStartedAt) continue;
+      const key = recordKey(record);
+      if (fromDelayedStartup && (localTouchedBeforeStartupLoad.has(key) || threads.get(record.threadId)?.has(taskKey(record)))) continue;
+      if (fromDelayedStartup && clearedBeforeStartupLoad.has(record.threadId)) {
+        pendingWrites.set(JSON.stringify([key, record.startedAt, record.parentToolCallId]), { record, remove: true, delayed: false });
+        continue;
+      }
+      initialRecords.set(key, record);
+    }
+    startupLoadPending = false;
+    localTouchedBeforeStartupLoad.clear();
+    clearedBeforeStartupLoad.clear();
+  }
+  function applyPendingWrites(loadedTasks: PersistedBackgroundTask[]): PersistedBackgroundTask[] {
+    const persisted = new Map(loadedTasks.map(record => [recordKey(record), record]));
+    const records = new Map(persisted);
     for (const change of pendingWrites.values()) {
       const key = recordKey(change.record);
       const existing = records.get(key);
       if (change.remove) {
         if (existing?.startedAt === change.record.startedAt && existing.parentToolCallId === change.record.parentToolCallId) records.delete(key);
-      } else if (!existing || existing.startedAt <= change.record.startedAt) {
+        continue;
+      }
+      const onDisk = persisted.get(key);
+      const sameTimestamp = onDisk?.startedAt === change.record.startedAt;
+      const samePredecessor = sameTimestamp && onDisk.parentToolCallId === change.predecessorToolCallId;
+      if (onDisk && change.predecessorToolCallId !== undefined && !samePredecessor) continue;
+      if (!existing || existing.startedAt < change.record.startedAt ||
+          (existing.startedAt === change.record.startedAt && (!change.delayed || samePredecessor))) {
+        if (!change.delayed && sameTimestamp && onDisk.parentToolCallId !== change.record.parentToolCallId) {
+          change.predecessorToolCallId = onDisk.parentToolCallId;
+        }
         records.set(key, change.record);
       }
     }
-    if (writeTaskState(persistPath, [...records.values()])) pendingWrites.clear();
+    return [...records.values()];
+  }
+  function flushPendingWrites() {
+    if (disposed || !persistPath || !hasPendingPersistenceWork()) { clearPersistRetry(); return; }
+    const asyncReconciled: Array<{ thread: string; deltas: BackgroundTaskDelta[] }> = [];
+    const locked = withTaskStateLock(persistPath, () => {
+      const loaded = loadTaskState(persistPath, maxAge, fsOps);
+      if (loaded.ioError !== 'none') return loaded.ioError === 'transient' ? 'transient' as const : 'failed' as const;
+      if (startupLoadPending) {
+        populateInitialRecords(loaded.tasks, true);
+        if (loaded.needsWrite) startupGcPending = true;
+      }
+      if (pendingReconciliations.size) {
+        for (const thread of [...pendingReconciliations]) {
+          const matched = matchingInitialRecords(thread, loaded.tasks);
+          clearInitialRecordsForThread(thread);
+          pendingReconciliations.delete(thread);
+          if (matched.length) {
+            queuePendingWrites(thread, matched, true);
+            asyncReconciled.push({ thread, deltas: matched.map(toInterruptedDelta) });
+          }
+        }
+      }
+      if (pendingWrites.size) {
+        const result = writeTaskState(persistPath, applyPendingWrites(loaded.tasks), fsOps);
+        if (result !== 'saved') return result;
+        pendingWrites.clear();
+        startupGcPending = false;
+        return 'saved' as const;
+      }
+      if (startupGcPending) {
+        if (loaded.needsWrite) {
+          const result = writeTaskState(persistPath, loaded.tasks, fsOps);
+          if (result !== 'saved') return result;
+        }
+        startupGcPending = false;
+      }
+      return 'saved' as const;
+    }, fsOps);
+    if (locked.status === 'contended') {
+      markPendingAddsDelayed();
+      transientRetryAttempt = 0;
+      schedulePersistRetry();
+      return;
+    }
+    if (locked.status === 'transient') {
+      markPendingAddsDelayed();
+      if (transientRetryAttempt < TRANSIENT_IO_MAX_RETRIES) {
+        transientRetryAttempt += 1;
+        schedulePersistRetry();
+      }
+      return;
+    }
+    if (locked.status === 'acquired') {
+      if (locked.value === 'saved') {
+        clearPersistRetry();
+      } else {
+        markPendingAddsDelayed();
+        if (locked.value === 'transient' && transientRetryAttempt < TRANSIENT_IO_MAX_RETRIES) {
+          transientRetryAttempt += 1;
+          schedulePersistRetry();
+        }
+      }
+    } else {
+      markPendingAddsDelayed();
+    }
+    for (const entry of asyncReconciled) {
+      if (disposed) break;
+      options.onAsyncDeltas?.(entry.thread, entry.deltas);
+    }
+  }
+  function persistTasks(thread: string, tasks: BackgroundTask[], remove: boolean) {
+    if (disposed || !persistPath) return;
+    queuePendingWrites(thread, tasks, remove);
+    if (!pendingWrites.size) return;
+    persistRetryAttempt = 0;
+    transientRetryAttempt = 0;
+    flushPendingWrites();
   }
   /**
    * Restart reconciliation: `clearThread`-shaped `interrupted` closes for persisted tasks of a
@@ -284,21 +845,86 @@ export function createBackgroundTaskTracker(options: {
    * the resumed agent learn the tasks died with the previous host.
    */
   function reconcilePersisted(thread: string): BackgroundTaskDelta[] {
-    if (!persistPath) return [];
-    const records = readTaskState(persistPath, maxAge);
-    const active = threads.get(thread);
-    const pending = records.filter(record => {
-      const initial = initialRecords.get(recordKey(record));
-      return record.threadId === thread && !active?.has(taskKey(record)) &&
-        initial?.startedAt === record.startedAt && initial.parentToolCallId === record.parentToolCallId;
-    });
+    if (disposed || !persistPath) return [];
+    const hasInitialForThread = [...initialRecords.values()].some(record => record.threadId === thread);
+    if (!startupLoadPending && !hasInitialForThread) return [];
+    let pending: PersistedBackgroundTask[] = [];
+    const locked = withTaskStateLock(persistPath, () => {
+      const loaded = loadTaskState(persistPath, maxAge, fsOps);
+      if (loaded.ioError !== 'none') return { outcome: loaded.ioError, readSucceeded: false };
+      if (startupLoadPending) {
+        populateInitialRecords(loaded.tasks, true);
+        if (loaded.needsWrite) startupGcPending = true;
+      }
+      pending = matchingInitialRecords(thread, loaded.tasks);
+      clearInitialRecordsForThread(thread);
+      pendingReconciliations.delete(thread);
+      if (pending.length) queuePendingWrites(thread, pending, true);
+      if (pendingWrites.size) {
+        const result = writeTaskState(persistPath, applyPendingWrites(loaded.tasks), fsOps);
+        if (result === 'saved') {
+          pendingWrites.clear();
+          startupGcPending = false;
+          return { outcome: 'saved' as const, readSucceeded: true };
+        }
+        return { outcome: result === 'transient' ? 'transient' as const : 'fatal' as const, readSucceeded: true };
+      }
+      if (startupGcPending) {
+        if (loaded.needsWrite) {
+          const result = writeTaskState(persistPath, loaded.tasks, fsOps);
+          if (result !== 'saved') return { outcome: result === 'transient' ? 'transient' as const : 'fatal' as const, readSucceeded: true };
+        }
+        startupGcPending = false;
+      }
+      return { outcome: 'saved' as const, readSucceeded: true };
+    }, fsOps);
+    if (locked.status === 'acquired') {
+      if (locked.value.outcome === 'saved') {
+        if (hasPendingPersistenceWork()) {
+          persistRetryAttempt = 0;
+          transientRetryAttempt = 0;
+          schedulePersistRetry();
+        } else {
+          clearPersistRetry();
+        }
+      } else if (locked.value.outcome === 'transient') {
+        markPendingAddsDelayed();
+        if (!locked.value.readSucceeded) pendingReconciliations.add(thread);
+        persistRetryAttempt = 0;
+        transientRetryAttempt = 1;
+        schedulePersistRetry();
+      } else {
+        markPendingAddsDelayed();
+      }
+    } else {
+      const loaded = loadTaskState(persistPath, maxAge, fsOps);
+      if (loaded.ioError === 'none') {
+        if (startupLoadPending) {
+          populateInitialRecords(loaded.tasks, true);
+          if (loaded.needsWrite) startupGcPending = true;
+        }
+        pending = matchingInitialRecords(thread, loaded.tasks);
+        clearInitialRecordsForThread(thread);
+        pendingReconciliations.delete(thread);
+        if (pending.length) queuePendingWrites(thread, pending, true);
+        if (locked.status === 'contended' && hasPendingPersistenceWork()) {
+          persistRetryAttempt = 0;
+          transientRetryAttempt = 0;
+          schedulePersistRetry();
+        } else if (locked.status === 'transient' && hasPendingPersistenceWork()) {
+          persistRetryAttempt = 0;
+          transientRetryAttempt = 1;
+          schedulePersistRetry();
+        }
+      } else if (loaded.ioError === 'transient' && locked.status !== 'error') {
+        pendingReconciliations.add(thread);
+        persistRetryAttempt = 0;
+        transientRetryAttempt = 1;
+        schedulePersistRetry();
+      }
+    }
     if (!pending.length) return [];
-    const results = pending.map(record => delta({
-      taskId: record.taskId, taskType: record.taskType, description: record.description, parentToolCallId: record.parentToolCallId,
-      ...(record.transcriptPath ? { transcriptPath: record.transcriptPath } : {}), ...(record.outputFile ? { outputFile: record.outputFile } : {}),
-    }, 'interrupted', 'stopped'));
-    persistTasks(thread, pending, true);
-    return results;
+    return pending.map(toInterruptedDelta);
   }
   function syncPolling() {
     for (const [thread, paths] of watchers) {
@@ -307,16 +933,21 @@ export function createBackgroundTaskTracker(options: {
       }
       if (!paths.size) watchers.delete(thread);
     }
-    if (!watchers.size && timer) { clearInterval(timer); timer = undefined; }
+    if (!watchers.size) {
+      if (timer) { clearInterval(timer); timer = undefined; }
+      if (catchUpTimer) { clearImmediate(catchUpTimer); catchUpTimer = undefined; }
+      readBuffer = undefined;
+    }
   }
   function settle(thread: string, id: string, status: NonNullable<BackgroundTaskDelta['status']>, taskStatus: string, summary?: string, type?: BackgroundTask['taskType']) {
     const tasks = threads.get(thread);
     const removed: BackgroundTask[] = [];
     const results: BackgroundTaskDelta[] = [];
+    const boundedSummary = summary ? boundText(summary, maxToolOutputChars) : summary;
     for (const [key, task] of tasks ?? []) {
-      if ((task.taskId === id || task.taskId.endsWith(`/${id}`) || id.endsWith(`/${task.taskId}`)) && (!type || task.taskType === type)) { tasks!.delete(key); removed.push(task); results.push(delta(task, status, taskStatus, summary)); }
+      if ((task.taskId === id || task.taskId.endsWith(`/${id}`) || id.endsWith(`/${task.taskId}`)) && (!type || task.taskType === type)) { tasks!.delete(key); removed.push(task); results.push(delta(task, status, taskStatus, boundedSummary)); }
     }
-    if (!tasks?.size) threads.delete(thread);
+    if (!tasks?.size) { threads.delete(thread); streamBuffers.delete(thread); }
     syncPolling();
     if (removed.length) {
       persistTasks(thread, removed, true);
@@ -324,47 +955,276 @@ export function createBackgroundTaskTracker(options: {
     }
     return results;
   }
-  function inspectTextForCompletions(thread: string, text: string): BackgroundTaskDelta[] {
+  function inspectTextForCompletions(thread: string, text: string, maxMatchIndex = text.length): BackgroundTaskDelta[] {
+    if (disposed || !threads.get(thread)?.size) return [];
     const results: BackgroundTaskDelta[] = [];
     // Bound each result at the next announcement so failures cannot spill into another task.
-    const announcements = [...text.matchAll(/Task id "([^"]+)" (finished with result:|was canceled|was killed|terminated|failed)/gi)];
+    const announcements = [...text.matchAll(TASK_ANNOUNCEMENT_RE)];
     announcements.forEach((match, i) => {
+      if (match.index! >= maxMatchIndex) return;
       const result = text.slice(match.index! + match[0].length, announcements[i + 1]?.index ?? text.length);
-      const failed = match[2].toLowerCase() === 'failed' || /Command exited with code ([1-9]\d*)|Encountered error/i.test(result);
-      const killed = /was canceled|was killed|terminated/i.test(match[2]) || /Step was canceled/i.test(result);
+      const failed = match[2].toLowerCase() === 'failed' || RESULT_FAILED_RE.test(result);
+      const killed = /was canceled|was killed|terminated/i.test(match[2]) || RESULT_KILLED_RE.test(result);
       results.push(...settle(thread, match[1], failed ? 'failed' : killed ? 'interrupted' : 'completed', failed ? 'failed' : killed ? 'killed' : 'completed', result.trim(), 'local_bash'));
     });
-    for (const match of text.matchAll(/Subagent ([^\s"]+) has gone idle/gi)) results.push(...settle(thread, match[1], 'completed', 'completed', undefined, 'local_subagent'));
+    for (const match of text.matchAll(SUBAGENT_IDLE_RE)) {
+      if (match.index! >= maxMatchIndex) break;
+      results.push(...settle(thread, match[1], 'completed', 'completed', undefined, 'local_subagent'));
+    }
     return results;
   }
+  function appendPendingResult(pendingAnnouncement: PendingAnnouncement, fragment: string) {
+    if (!fragment) return;
+    const flagWindow = pendingAnnouncement.flagTail ? pendingAnnouncement.flagTail + fragment : fragment;
+    if (!pendingAnnouncement.failed && RESULT_FAILED_RE.test(flagWindow)) pendingAnnouncement.failed = true;
+    if (!pendingAnnouncement.killed && RESULT_KILLED_RE.test(flagWindow)) pendingAnnouncement.killed = true;
+    pendingAnnouncement.flagTail = flagWindow.slice(-FLAG_TAIL_CHARS);
+
+    const budget = Math.max(0, maxToolOutputChars - TRUNCATION_MARKER.length);
+    const headLen = Math.ceil(budget / 2);
+    const tailLen = budget - headLen;
+    const rollingTailCap = tailLen + 256;
+
+    if (!pendingAnnouncement.truncated) {
+      const piece = pendingAnnouncement.summaryHead ? fragment : fragment.trimStart();
+      if (!piece) return;
+      if (pendingAnnouncement.summaryHead.length + piece.length <= maxToolOutputChars) {
+        pendingAnnouncement.summaryHead += piece;
+      } else {
+        const full = pendingAnnouncement.summaryHead + piece;
+        pendingAnnouncement.truncated = true;
+        pendingAnnouncement.summaryHead = sliceHeadSafe(full, headLen);
+        pendingAnnouncement.summaryTail = sliceTailSafe(full, rollingTailCap);
+      }
+    } else {
+      const combinedTail = pendingAnnouncement.summaryTail ? pendingAnnouncement.summaryTail + fragment : fragment;
+      pendingAnnouncement.summaryTail = sliceTailSafe(combinedTail, rollingTailCap);
+    }
+  }
+  function finalizePendingAnnouncement(thread: string, pendingAnnouncement: PendingAnnouncement): BackgroundTaskDelta[] {
+    let summary: string;
+    if (!pendingAnnouncement.truncated) {
+      summary = pendingAnnouncement.summaryHead.trim();
+    } else if (maxToolOutputChars <= TRUNCATION_MARKER.length + 2) {
+      summary = pendingAnnouncement.summaryHead.trim().slice(0, maxToolOutputChars);
+    } else {
+      const budget = maxToolOutputChars - TRUNCATION_MARKER.length;
+      const headLen = Math.ceil(budget / 2);
+      const tailLen = budget - headLen;
+      const head = sliceHeadSafe(pendingAnnouncement.summaryHead, headLen);
+      const tail = sliceTailSafe(pendingAnnouncement.summaryTail.trimEnd(), tailLen);
+      summary = `${head}${TRUNCATION_MARKER}${tail}`.trim();
+    }
+    const status = pendingAnnouncement.failed ? 'failed' : pendingAnnouncement.killed ? 'interrupted' : 'completed';
+    const taskStatus = pendingAnnouncement.failed ? 'failed' : pendingAnnouncement.killed ? 'killed' : 'completed';
+    return settle(thread, pendingAnnouncement.taskId, status, taskStatus, summary, 'local_bash');
+  }
+  function safeSliceCut(text: string, overlap: number): number {
+    let cut = text.length - overlap;
+    if (cut > 0 && text.charCodeAt(cut - 1) >= 0xd800 && text.charCodeAt(cut - 1) <= 0xdbff) cut -= 1;
+    return cut;
+  }
+  function feedStreamingCompletions(
+    thread: string,
+    scan: StreamingScanState,
+    incoming: string,
+    final: boolean,
+    maxChars: number,
+    overlap: number,
+  ): BackgroundTaskDelta[] {
+    const text = scan.buffer ? scan.buffer + incoming : incoming;
+    if (!final && text.length <= maxChars) {
+      scan.buffer = text;
+      return [];
+    }
+    if (!threads.get(thread)?.size) {
+      scan.buffer = '';
+      scan.pending = undefined;
+      return [];
+    }
+    const results: BackgroundTaskDelta[] = [];
+    const limit = final ? text.length : safeSliceCut(text, overlap);
+    let cursor = 0;
+
+    if (COMPLETION_HINT.test(text)) {
+      for (const match of text.matchAll(TASK_ANNOUNCEMENT_RE)) {
+        const index = match.index!;
+        if (index >= limit) break;
+        if (scan.pending) {
+          if (index > cursor) appendPendingResult(scan.pending, text.slice(cursor, index));
+          results.push(...finalizePendingAnnouncement(thread, scan.pending));
+          scan.pending = undefined;
+        }
+        scan.pending = {
+          taskId: match[1],
+          failed: match[2].toLowerCase() === 'failed',
+          killed: /was canceled|was killed|terminated/i.test(match[2]),
+          summaryHead: '',
+          summaryTail: '',
+          truncated: false,
+          flagTail: '',
+        };
+        cursor = index + match[0].length;
+      }
+      for (const match of text.matchAll(SUBAGENT_IDLE_RE)) {
+        if (match.index! >= limit) break;
+        results.push(...settle(thread, match[1], 'completed', 'completed', undefined, 'local_subagent'));
+      }
+    }
+
+    if (final) {
+      if (scan.pending) {
+        if (cursor < text.length) appendPendingResult(scan.pending, text.slice(cursor));
+        results.push(...finalizePendingAnnouncement(thread, scan.pending));
+        scan.pending = undefined;
+      }
+      scan.buffer = '';
+    } else {
+      const keepFrom = Math.max(limit, cursor);
+      if (scan.pending && cursor < limit) {
+        appendPendingResult(scan.pending, text.slice(cursor, limit));
+      }
+      if (threads.get(thread)?.size) {
+        scan.buffer = text.slice(keepFrom);
+      } else {
+        scan.buffer = '';
+        scan.pending = undefined;
+      }
+    }
+    return results;
+  }
+  function consumeTranscriptChunk(
+    thread: string,
+    path: string,
+    state: TranscriptWatcherState,
+    chunk: string,
+    remaining: boolean,
+  ): BackgroundTaskDelta[] {
+    const deltas: BackgroundTaskDelta[] = [];
+    const plainLines: string[] = [];
+    const flushPlain = (final = true) => {
+      if (!plainLines.length && !state.plainScan) return;
+      const scan = state.plainScan ??= { buffer: '' };
+      const block = plainLines.length ? plainLines.join('\n') + '\n' : '';
+      plainLines.length = 0;
+      deltas.push(...feedStreamingCompletions(thread, scan, block, final, maxLineChars, lineOverlap));
+      if (final) state.plainScan = undefined;
+    };
+    const feedOversized = (raw: string, final: boolean) => {
+      const oversized = state.oversized ??= { prefix: '' };
+      if (!oversized.kind) {
+        raw = oversized.prefix + raw;
+        const start = raw.replace(/^[ \t\r]*/, '');
+        if (!start) return;
+        const opener = start[0];
+        const next = start.slice(1).replace(/^[ \t\r]*/, '');
+        if (!final && (
+          ((opener === '{' || opener === '[') && !next) ||
+          (opener === '[' && ['true', 'false', 'null'].some(literal => literal.startsWith(next)))
+        )) {
+          oversized.prefix = opener + next;
+          return;
+        }
+        // Brackets also introduce plain log prefixes such as [INFO].
+        const json = opener === '"' ||
+          (opener === '{' && /^["}]/.test(next)) ||
+          (opener === '[' && JSON_ARRAY_START.test(next));
+        oversized.kind = json ? 'json' : 'plain';
+        oversized.prefix = '';
+      }
+      if (oversized.kind === 'plain') {
+        flushPlain(false);
+        const scan = state.plainScan ??= { buffer: '' };
+        deltas.push(...feedStreamingCompletions(thread, scan, final ? raw + '\n' : raw, false, maxLineChars, lineOverlap));
+        return;
+      }
+      flushPlain();
+      if (disposed || watchers.get(thread)?.get(path) !== state) return;
+      const json = oversized.json ??= { frames: [], skipDepth: 0, key: '', escape: '', hasText: false, done: false, invalid: false };
+      const text = readTranscriptJson(json, raw, maxLineChars);
+      if (!json.invalid) {
+        const scan = oversized.scan ??= { buffer: '' };
+        deltas.push(...feedStreamingCompletions(thread, scan, text, final && json.done, maxLineChars, lineOverlap));
+      }
+    };
+    let pos = 0;
+    while (pos < chunk.length) {
+      if (disposed || watchers.get(thread)?.get(path) !== state) break;
+      const nl = chunk.indexOf('\n', pos);
+      const final = nl !== -1;
+      const line = state.partial + chunk.slice(pos, final ? nl : chunk.length);
+      pos = final ? nl + 1 : chunk.length;
+      state.partial = '';
+      if (state.oversized || line.length > maxLineChars) {
+        feedOversized(line, final);
+        if (final) state.oversized = undefined;
+      } else if (!final) {
+        state.partial = line;
+      } else if (line && (state.plainScan || plainLines.length || COMPLETION_HINT.test(line) || line.includes('\\u'))) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          plainLines.push(line);
+          continue;
+        }
+        flushPlain();
+        if (disposed || watchers.get(thread)?.get(path) !== state) break;
+        const extracted = extractTranscriptText(parsed);
+        if (COMPLETION_HINT.test(extracted)) {
+          deltas.push(...inspectTextForCompletions(thread, extracted));
+        }
+      }
+    }
+    if (!disposed && watchers.get(thread)?.get(path) === state) flushPlain(!remaining && !state.partial && !state.oversized);
+    return deltas;
+  }
+  function scheduleCatchUp() {
+    if (catchUpTimer || disposed || !watchers.size) return;
+    catchUpTimer = setImmediate(() => {
+      catchUpTimer = undefined;
+      if (!disposed && watchers.size) poll();
+    });
+    catchUpTimer.unref?.();
+  }
   function poll() {
+    if (catchUpTimer) { clearImmediate(catchUpTimer); catchUpTimer = undefined; }
+    if (disposed || !watchers.size) return;
+    let hasMore = false;
     for (const [thread, paths] of watchers) for (const [path, state] of paths) {
+      if (disposed) return;
       let fd: number | undefined;
-      let text = '';
+      let chunk = '';
+      let remaining = false;
       try {
         fd = openSync(path, 'r');
         const size = fstatSync(fd).size;
-        if (size < state.offset) { state.offset = 0; state.partial = ''; state.decoder = new StringDecoder('utf8'); }
+        if (size < state.offset) {
+          state.offset = 0;
+          state.partial = '';
+          state.oversized = undefined;
+          state.plainScan = undefined;
+          state.decoder = new StringDecoder('utf8');
+        }
         if (size > state.offset) {
-          const buffer = Buffer.alloc(size - state.offset);
-          const count = readSync(fd, buffer, 0, buffer.length, state.offset);
+          const toRead = Math.min(size - state.offset, maxReadBytes);
+          readBuffer ??= Buffer.allocUnsafe(maxReadBytes);
+          const count = readSync(fd, readBuffer, 0, toRead, state.offset);
           state.offset += count;
-          const appended = state.partial + state.decoder.write(buffer.subarray(0, count));
-          const end = appended.lastIndexOf('\n');
-          state.partial = appended.slice(end + 1);
-          text = appended.slice(0, end + 1);
+          if (count > 0) chunk = state.decoder.write(readBuffer.subarray(0, count));
+          remaining = count > 0 && state.offset < size;
         }
       } catch { /* The CLI may not have created the transcript yet. */ }
       finally { if (fd !== undefined) closeSync(fd); }
-      if (text) {
-        // Transcript records encode message text as JSON strings.
-        text = text.split('\n').map(line => { try { return extractToolOutputText({ toolCallId: '', rawOutput: JSON.parse(line) }).replace(/\\"/g, '"'); } catch { return line; } }).join('\n');
-        const deltas = inspectTextForCompletions(thread, text);
+      if (chunk) {
+        const deltas = consumeTranscriptChunk(thread, path, state, chunk, remaining);
         if (deltas.length) options.onAsyncDeltas?.(thread, deltas);
       }
+      if (remaining && !disposed && watchers.get(thread)?.get(path) === state) hasMore = true;
     }
+    if (hasMore) scheduleCatchUp();
   }
-  function handleToolEventForThread(thread: string, event: RecordedToolEvent): BackgroundTaskDelta[] {
+  function handleToolEventForThread(thread: string, event: RetainedToolEvent): BackgroundTaskDelta[] {
     if (disposed) return [];
     // A failed run_command event with empty/whitespace output is the exact signature of the
     // "silent give-up" turn: record it even though no background task is registered for it.
@@ -383,15 +1243,15 @@ export function createBackgroundTaskTracker(options: {
       ?? [event.title, event.kind].find(v => /^(run_command|schedule|invoke_subagent|manage_task|manage_subagents)$/.test(v ?? '')) ?? '';
     const action = String(input.Action ?? '').toLowerCase();
     const results: BackgroundTaskDelta[] = [];
+    const outputTruncated = Boolean((event as RetainedToolEvent).outputTruncated);
     if (name === 'manage_task') {
       const id = first(input.TaskId);
       if (action === 'kill' && id) return settle(thread, id, 'interrupted', 'killed', text, 'local_bash');
-      if (action === 'status' && id && !/Step is still running|status\s*[:=]\s*RUNNING/i.test(text) && /Command exited with code \d+|SCHEDULE_FINISHED|Step was canceled|status\s*[:=]\s*(?:DONE|CANCELED|ERROR|COMPLETED|FAILED|KILLED|STOPPED)|not running|not found|unknown task|finished with result/i.test(text)) {
-        const failed = /Command exited with code [1-9]\d*|ERROR|FAILED/i.test(text);
-        const killed = /CANCELED|KILLED|interrupted/i.test(text);
-        return settle(thread, id, failed ? 'failed' : killed ? 'interrupted' : 'completed', failed ? 'failed' : killed ? 'killed' : 'completed', text, 'local_bash');
+      if (action === 'status' && id) {
+        const status = event.outputTruncated ? event.taskStatusFromOutput : parseTaskStatus(text);
+        if (status && status !== 'running') return settle(thread, id, status, status === 'interrupted' ? 'killed' : status, text, 'local_bash');
       }
-      if (action === 'list' && /No running tasks|\| Start Time \| Task ID \| Tool \| Description \|/i.test(text)) {
+      if (action === 'list' && !outputTruncated && /No running tasks|\| Start Time \| Task ID \| Tool \| Description \|/i.test(text)) {
         for (const task of getActiveTasks(thread)) {
           const present = containsTaskToken(text, task.taskId) || containsTaskToken(text, task.taskId.split('/').pop()!);
           if (task.taskType === 'local_bash' && !present) results.push(...settle(thread, task.taskId, 'completed', 'completed', text, task.taskType));
@@ -399,8 +1259,8 @@ export function createBackgroundTaskTracker(options: {
       }
     }
     if (name === 'manage_subagents') {
-      const empty = /no active (?:direct )?subagents/i.test(text) || /^\s*\[\s*\]\s*$/.test(text)
-        || (Array.isArray(event.rawOutput) && event.rawOutput.length === 0);
+      const empty = !outputTruncated && (/no active (?:direct )?subagents/i.test(text) || /^\s*\[\s*\]\s*$/.test(text)
+        || (Array.isArray(event.rawOutput) && event.rawOutput.length === 0));
       for (const task of getActiveTasks(thread)) {
         if (task.taskType !== 'local_subagent') continue;
         const kill = action === 'kill_all' || (action === 'kill' && Array.isArray(input.ConversationIds) && input.ConversationIds.includes(task.taskId));
@@ -425,6 +1285,7 @@ export function createBackgroundTaskTracker(options: {
     return [...results, ...registerTask(thread, task)];
   }
   function registerTask(thread: string, task: BackgroundTask): BackgroundTaskDelta[] {
+    if (disposed) return [];
     const tasks = threads.get(thread) ?? new Map<string, BackgroundTask>();
     if (tasks.has(taskKey(task))) return [];
     tasks.set(taskKey(task), task); threads.set(thread, tasks);
@@ -459,11 +1320,11 @@ export function createBackgroundTaskTracker(options: {
       ...(input.IsDaemon === true || input.IsDaemon === 'true' ? { daemon: true } : {}),
     });
   }
-  function settleOrphanCommand(thread: string, event: RecordedToolEvent): BackgroundTaskDelta[] {
+  function settleOrphanCommand(thread: string, event: RetainedToolEvent): BackgroundTaskDelta[] {
     const task = threads.get(thread)?.get(taskKey({ taskType: 'local_bash', taskId: event.toolCallId }));
     if (!task?.orphan || !TERMINAL_TOOL_STATUS.test(event.status ?? '')) return [];
     const text = extractToolOutputText(event).trim();
-    const failed = event.status === 'failed' || /(?:The c|C)ommand exited with code [1-9]\d*/.test(text);
+    const failed = event.status === 'failed' || (event.outputTruncated ? event.commandFailed : /command exited with code [1-9]\d*/i.test(text));
     const killed = !failed && /cancel/i.test(event.status ?? '');
     return settle(thread, task.taskId, failed ? 'failed' : killed ? 'interrupted' : 'completed',
       failed ? 'failed' : killed ? 'killed' : 'completed', text || undefined, 'local_bash');
@@ -613,15 +1474,19 @@ export function createBackgroundTaskTracker(options: {
   }
   function getActiveTasks(thread: string): ReadonlyArray<BackgroundTask> { return [...(threads.get(thread)?.values() ?? [])].map(task => ({ ...task })); }
   function clearThread(thread: string, emitCloseDeltas = false): BackgroundTaskDelta[] {
+    if (disposed) return [];
     if (holds.get(thread)?.boundary) dropHold(thread);
     const active = getActiveTasks(thread);
     const results = emitCloseDeltas ? active.map(task => delta(task, 'interrupted', 'stopped')) : [];
     threads.delete(thread); threadTools.delete(thread); streamBuffers.delete(thread); silentTurns.delete(thread); syncPolling();
+    pendingReconciliations.delete(thread);
+    if (startupLoadPending) clearedBeforeStartupLoad.add(thread);
     const recovered = [...initialRecords.values()].filter(record => record.threadId === thread);
     persistTasks(thread, [...recovered, ...active], true);
     return results;
   }
   function handleInbound(request: unknown): { request: unknown; deltas: TrackerDelta[] } {
+    if (disposed) return { request, deltas: [] };
     const message = request as { method?: string; params?: { threadId?: string } } | null;
     if (!message || typeof message.params?.threadId !== 'string') return { request, deltas: [] };
     const thread = message.params.threadId;
@@ -665,19 +1530,96 @@ export function createBackgroundTaskTracker(options: {
   // next resume must still report the tasks as interrupted.
   const initialRecords = new Map<string, PersistedBackgroundTask>();
   if (persistPath) {
-    const records = readTaskState(persistPath, maxAge);
-    for (const record of records) initialRecords.set(recordKey(record), record);
-    writeTaskState(persistPath, records);
+    const locked = withTaskStateLock(persistPath, () => {
+      const state = loadTaskState(persistPath, maxAge, fsOps);
+      let gcWriteError: 'none' | 'transient' | 'failed' = 'none';
+      if (state.ioError === 'none' && state.needsWrite) {
+        const writeResult = writeTaskState(persistPath, state.tasks, fsOps);
+        if (writeResult !== 'saved') gcWriteError = writeResult;
+      }
+      return { state, gcWriteError };
+    }, fsOps);
+    const state = locked.status === 'acquired' ? locked.value.state : loadTaskState(persistPath, maxAge, fsOps);
+    const gcWriteError = locked.status === 'acquired' ? locked.value.gcWriteError : 'none';
+    if (state.ioError === 'none') {
+      populateInitialRecords(state.tasks, false);
+      if (state.needsWrite && (
+        locked.status === 'contended' ||
+        locked.status === 'transient' ||
+        (locked.status === 'acquired' && gcWriteError === 'transient')
+      )) {
+        startupGcPending = true;
+        if (locked.status === 'transient' || (locked.status === 'acquired' && gcWriteError === 'transient')) transientRetryAttempt = 1;
+        schedulePersistRetry();
+      }
+    } else if (state.ioError === 'transient') {
+      startupLoadPending = true;
+      startupGcPending = true;
+      transientRetryAttempt = 1;
+      schedulePersistRetry();
+    }
+  }
+  function retainThreadTool(thread: string, id: string, event: RecordedToolEvent) {
+    const compacted = compactToolEvent(event, maxToolOutputChars);
+    let tools = threadTools.get(thread);
+    if (!tools) { tools = new Map(); threadTools.set(thread, tools); }
+    if (tools.has(id)) tools.delete(id);
+    tools.set(id, compacted);
+    if (tools.size > maxToolsPerThread) {
+      const activeTasks = threads.get(thread);
+      for (const key of tools.keys()) {
+        if (tools.size <= maxToolsPerThread) break;
+        if (key === id) continue;
+        if (activeTasks?.get(taskKey({ taskType: 'local_bash', taskId: key }))?.orphan) continue;
+        tools.delete(key);
+      }
+      while (tools.size > maxToolsPerThread) {
+        const oldest = tools.keys().next().value;
+        if (oldest === undefined || oldest === id) break;
+        tools.delete(oldest);
+      }
+    }
   }
   return {
     recordToolEvent(event: RecordedToolEvent) {
       if (disposed) return;
-      const queue = pending.get(event.toolCallId) ?? [];
-      queue.push(event);
-      pending.set(event.toolCallId, queue);
+      const compacted = compactToolEvent(event, maxToolOutputChars);
+      let queue = pending.get(compacted.toolCallId);
+      if (queue) {
+        pending.delete(compacted.toolCallId);
+      } else {
+        queue = [];
+      }
+      queue.push(compacted);
+      pending.set(compacted.toolCallId, queue);
+      pendingCount += 1;
+      while (pendingCount > maxPendingEvents) {
+        // Keep terminal updates available for correlation when one noisy call floods the queue.
+        let evicted = false;
+        for (const [key, events] of pending) {
+          const index = events.findIndex(update => !TERMINAL_TOOL_STATUS.test(update.status ?? ''));
+          if (index < 0) continue;
+          events.splice(index, 1);
+          if (!events.length) pending.delete(key);
+          evicted = true;
+          break;
+        }
+        if (!evicted) {
+          const first = pending.entries().next().value;
+          if (!first) break;
+          first[1].shift();
+          if (!first[1].length) pending.delete(first[0]);
+        }
+        pendingCount -= 1;
+      }
     },
-    handleToolEventForThread, inspectTextForCompletions, getActiveTasks, clearThread,
+    handleToolEventForThread,
+    inspectTextForCompletions(thread: string, text: string): BackgroundTaskDelta[] {
+      return inspectTextForCompletions(thread, text);
+    },
+    getActiveTasks, clearThread,
     processStdoutLine(line: string): string[] {
+      if (disposed) return [line];
       let message;
       try { message = JSON.parse(line); } catch { return [line]; }
       const response = steerResponse(message);
@@ -697,25 +1639,51 @@ export function createBackgroundTaskTracker(options: {
         if (typeof id === 'string') {
           const queue = pending.get(id);
           const queued = queue?.shift();
-          if (!queue?.length) pending.delete(id);
+          if (queued) pendingCount = Math.max(0, pendingCount - 1);
+          if (queue && !queue.length) pending.delete(id);
           // The fallback update belongs to this exact thread; prefer it over the unscoped hook.
           const event = update && typeof update === 'object' ? { ...update, toolCallId: id } as RecordedToolEvent : queued;
-          const tools = threadTools.get(params.threadId) ?? new Map<string, RecordedToolEvent>();
-          const known = tools.get(id);
+          const tools = threadTools.get(params.threadId);
+          const known = tools?.get(id);
           const merged = event ? mergeToolEvent(known, event) : known;
-          if (event && merged) { tools.set(id, merged); threadTools.set(params.threadId, tools); }
-          if (merged && entry?.kind === 'item.close' && !entry.noTurnFallback && entry.status === 'completed' && !TERMINAL_TOOL_STATUS.test(merged.status ?? '')) {
+          const isOrphanFlush = Boolean(
+            merged && entry?.kind === 'item.close' && !entry.noTurnFallback && entry.status === 'completed' && !TERMINAL_TOOL_STATUS.test(merged.status ?? ''),
+          );
+          const isTerminalEvent = Boolean(
+            event && merged && (TERMINAL_TOOL_STATUS.test(merged.status ?? '') || entry?.kind === 'item.close'),
+          );
+          if (isOrphanFlush && merged) {
             // SDK 0.6.178 flushes unfinished commands this way. The ACP integration test covers this shape.
             extra.push(...registerOrphanCommand(params.threadId, merged));
-          } else if (event && merged && (TERMINAL_TOOL_STATUS.test(merged.status ?? '') || entry?.kind === 'item.close')) {
+          } else if (isTerminalEvent && merged) {
             extra.push(...settleOrphanCommand(params.threadId, merged));
             extra.push(...handleToolEventForThread(params.threadId, merged));
+          }
+          const isActiveOrphan = Boolean(threads.get(params.threadId)?.get(taskKey({ taskType: 'local_bash', taskId: id }))?.orphan);
+          const shouldEvict =
+            Boolean(merged && TERMINAL_TOOL_STATUS.test(merged.status ?? '')) ||
+            (entry?.kind === 'item.close' && !isActiveOrphan && !event) ||
+            (isOrphanFlush && !isActiveOrphan);
+          if (shouldEvict) {
+            if (tools) {
+              tools.delete(id);
+              if (!tools.size) threadTools.delete(params.threadId);
+            }
+          } else if (event && merged) {
+            retainThreadTool(params.threadId, id, merged);
           }
         }
         if (entry?.settlesTurn === true) { exemptAfterHold(params.threadId, true); dropHold(params.threadId); } // e.g. provider.error: BB settles the turn itself.
         if (entry?.kind === 'turn.open' && !routeTurnOpen(params.threadId)) { modified = true; continue; }
         if (entry?.kind === 'item.textDelta' && typeof entry.text === 'string') {
-          streamBuffers.set(params.threadId, (streamBuffers.get(params.threadId) ?? '') + entry.text);
+          if (threads.get(params.threadId)?.size) {
+            let scan = streamBuffers.get(params.threadId);
+            if (!scan) { scan = { buffer: '' }; streamBuffers.set(params.threadId, scan); }
+            extra.push(...feedStreamingCompletions(params.threadId, scan, entry.text, false, maxStreamChars, streamOverlap));
+            if (!threads.get(params.threadId)?.size) streamBuffers.delete(params.threadId);
+          } else {
+            streamBuffers.delete(params.threadId);
+          }
           // Visible agent text (not reasoning) marks the turn as non-silent.
           if (entry.text.trim() && entry.channel !== 'reasoningText' && entry.channel !== 'reasoningSummary') {
             silentState(params.threadId).agentText = true;
@@ -724,9 +1692,9 @@ export function createBackgroundTaskTracker(options: {
           extra.push(...inspectTextForCompletions(params.threadId, entry.text));
         }
         if (entry?.kind === 'item.textClose' || entry?.kind === 'turn.boundary') {
-          const buffered = streamBuffers.get(params.threadId);
+          const scan = streamBuffers.get(params.threadId);
           streamBuffers.delete(params.threadId);
-          if (buffered) extra.push(...inspectTextForCompletions(params.threadId, buffered));
+          if (scan) extra.push(...feedStreamingCompletions(params.threadId, scan, '', true, maxStreamChars, streamOverlap));
         }
         if (entry?.kind === 'item.textClose' && typeof entry.text === 'string' && entry.text.trim() && entry.channel !== 'reasoningText' && entry.channel !== 'reasoningSummary') {
           silentState(params.threadId).agentText = true;
@@ -767,6 +1735,21 @@ export function createBackgroundTaskTracker(options: {
     handleInboundRequest(request: unknown): TrackerDelta[] { return handleInbound(request).deltas; },
     /** Whether a completed boundary is currently held for the thread. */
     isHoldingTurn(thread: string): boolean { return holds.get(thread)?.boundary !== undefined; },
-    dispose() { disposed = true; for (const hold of holds.values()) clearHoldTimers(hold); holds.clear(); threads.clear(); pending.clear(); threadTools.clear(); streamBuffers.clear(); silentTurns.clear(); watchers.clear(); if (timer) clearInterval(timer); timer = undefined; },
+    dispose() {
+      disposed = true;
+      clearPersistRetry();
+      startupLoadPending = false;
+      startupGcPending = false;
+      initialRecords.clear();
+      pendingWrites.clear();
+      pendingReconciliations.clear();
+      localTouchedBeforeStartupLoad.clear();
+      clearedBeforeStartupLoad.clear();
+      for (const hold of holds.values()) clearHoldTimers(hold);
+      holds.clear(); threads.clear(); pending.clear(); pendingCount = 0; threadTools.clear(); streamBuffers.clear(); silentTurns.clear(); watchers.clear();
+      if (timer) { clearInterval(timer); timer = undefined; }
+      if (catchUpTimer) { clearImmediate(catchUpTimer); catchUpTimer = undefined; }
+      readBuffer = undefined;
+    },
   };
 }
