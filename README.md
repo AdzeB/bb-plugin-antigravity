@@ -131,7 +131,7 @@ To select an Antigravity profile for a session, turn on profile routing in Setti
 bb plugin config antigravity-cli set profileRoutingEnabled true
 ```
 
-Set `BB_ANTIGRAVITY_GEMINI_DIR` to select the Gemini directory. Set `BB_ANTIGRAVITY_APP_DATA_DIR` to select the Antigravity app data directory. Turning profile routing off pauses routed sessions. To resume a routed session, turn routing back on and use the original profile.
+Use `BB_ANTIGRAVITY_GEMINI_DIR` to provide the absolute path of the Gemini directory on the agent host. Use `BB_ANTIGRAVITY_APP_DATA_DIR` to select the app data directory by name. The default name is `antigravity-cli`. Start a new thread to use the selected profile. When routing is off, BB blocks new turns and resume requests for routed sessions. To resume a routed session, turn routing back on and use the original profile.
 
 The plugin stores these boolean preferences. BB and the CLI can retain their normal conversations and diagnostics. Prompts, workspace context, and tool results are processed by Antigravity and its service. Disabling CLI telemetry does not disable service processing or conversation storage. Read [SECURITY.md](SECURITY.md) for the trust and privacy details.
 
