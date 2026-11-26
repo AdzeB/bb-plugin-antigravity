@@ -14,7 +14,9 @@ Do not post credentials or raw private session logs in public issues. Report a s
 
 Background task tracking saves descriptions, task/thread identifiers, and output/transcript paths in `~/.bb/plugin-data/bb-plugin-antigravity/background-tasks.json` (or the directory selected by `BB_ANTIGRAVITY_TASK_STATE_DIR`). Descriptions can include command text. Records expire after three days when state is processed; this is not a timed secure-erasure guarantee. Treat this file and CLI transcripts as private runtime data, and do not attach them to public issues without reviewing and redacting them.
 
-Profile routing bindings store BB thread and Antigravity session identifiers, a profile fingerprint, and an update timestamp. Raw credentials stay with Antigravity. Treat the bindings as private runtime data.
+## Profile routing state
+
+For a routed session, BB's saved provider session ID contains the native Antigravity session ID and the effective profile fingerprint. The fingerprint calculation includes the BB thread ID. Raw credentials stay with Antigravity. Treat saved provider session IDs as private runtime data.
 
 ## Public contribution and release checks
 
