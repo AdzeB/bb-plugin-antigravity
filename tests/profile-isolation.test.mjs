@@ -96,20 +96,20 @@ test('unresolved host agy fails with an installation diagnostic and never uses s
   try {
     await runPhase('missing-host-agy', root);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
 test('routed stop force-terminates a CLI that ignores cancellation with a steer queued', async t => {
   const root = createSyntheticWorkspace();
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
   await runPhase('unresponsive-stop', root);
 });
 
 for (const state of ['missing', 'corrupt']) {
   test(`routing survives host restart with ${state} local binding state`, async t => {
     const root = createSyntheticWorkspace();
-    t.after(() => rmSync(root, { recursive: true, force: true }));
+    t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
     // A directory at the old binding path prevents the prototype from writing the binding.
     const oldBindingPath = join(root, 'state', 'session-profiles.json');
     mkdirSync(oldBindingPath, { recursive: true });
