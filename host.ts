@@ -20,10 +20,12 @@ import {
   hashAntigravityProfile,
   matchesProfileSessionId,
 } from "./profile-bindings.ts";
+import { createCompactionVerifier } from "./compaction.ts";
 
 registerAntigravityAcpDialect();
 
 let rawStdoutWrite: typeof process.stdout.write | null = null;
+const compaction = createCompactionVerifier();
 export const backgroundTaskTracker = createBackgroundTaskTracker({
   persistPath: defaultBackgroundTaskStatePath(),
   onAsyncDeltas(threadId, deltas) {
@@ -353,6 +355,7 @@ function ensureStdoutFilter() {
         applyThreadCommandDescriptions(wrapped, commandDescriptionsThreads),
       );
     },
+    compaction.verify,
   );
   output.on("data", chunk => write(chunk));
   process.stdout.write = ((chunk: any, encodingOrCallback?: any, callback?: any) =>
@@ -441,10 +444,15 @@ export const experimental_providerBridge = {
       return;
     }
     const forwarded = subagentTransformed.parsed as Record<string, any> | null;
+    const usesRoutedProfile = activeIdentities.get(forwarded?.params?.threadId)?.profileHash !== undefined;
+    const compactError = compaction.prepare(forwarded, usesRoutedProfile);
+    if (compactError) {
+      process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: request?.id, error: { code: -32000, message: compactError } })}\n`);
+      return;
+    }
     if ((forwarded?.method === "turn/start" || forwarded?.method === "turn/steer") &&
         forwarded.jsonrpc === "2.0" && (typeof forwarded.id === "string" || typeof forwarded.id === "number") &&
-        typeof forwarded.params?.threadId === "string" && typeof forwarded.params?.clientRequestId === "string" &&
-        activeIdentities.get(forwarded.params.threadId)?.profileHash !== undefined) {
+        typeof forwarded.params?.threadId === "string" && typeof forwarded.params?.clientRequestId === "string" && usesRoutedProfile) {
       pendingInputs.set(forwarded.id, {
         threadId: forwarded.params.threadId,
         clientRequestId: forwarded.params.clientRequestId,

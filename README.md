@@ -131,7 +131,7 @@ To select an Antigravity profile for a session, turn on profile routing in Setti
 bb plugin config antigravity-cli set profileRoutingEnabled true
 ```
 
-Use `BB_ANTIGRAVITY_GEMINI_DIR` to provide the absolute path of the Gemini directory on the agent host. Use `BB_ANTIGRAVITY_APP_DATA_DIR` to select the app data directory by name. The default name is `antigravity-cli`. Start a new thread to use the selected profile. When routing is off, BB blocks new turns and resume requests for routed sessions. To resume a routed session, turn routing back on and use the original profile.
+Use `BB_ANTIGRAVITY_GEMINI_DIR` to provide the absolute path of the Gemini directory on the agent host. Use `BB_ANTIGRAVITY_APP_DATA_DIR` to select the app data directory by name. The default name is `antigravity-cli`. Start a new thread to use the selected profile. When routing is off, BB blocks new turns and resume requests for routed sessions. To resume a routed session, turn routing back on and use the original profile. Manual compaction currently verifies checkpoints only on the default Antigravity profile.
 
 The plugin stores these boolean preferences. BB and the CLI can retain their normal conversations and diagnostics. Prompts, workspace context, and tool results are processed by Antigravity and its service. Disabling CLI telemetry does not disable service processing or conversation storage. Read [SECURITY.md](SECURITY.md) for the trust and privacy details.
 
@@ -139,7 +139,9 @@ The plugin stores these boolean preferences. BB and the CLI can retain their nor
 
 See the [capability comparison](docs/FEATURES.md) for verified features and remaining gaps.
 
-Automatic CLI installation, conversation forking, manual compaction, and native thread archive/rename synchronization are not advertised. The plugin depends on your installed CLI and the shared BB ACP bridge.
+Use `/compact` after a conversation turn to reduce its context. BB confirms completion from the new checkpoint in the local Antigravity transcript.
+
+Automatic CLI installation, conversation forking, and native thread archive/rename synchronization are not advertised. The plugin depends on your installed CLI and the shared BB ACP bridge.
 
 ## Troubleshooting
 
