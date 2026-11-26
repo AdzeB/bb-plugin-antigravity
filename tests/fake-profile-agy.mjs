@@ -135,6 +135,10 @@ createInterface({ input: process.stdin }).on('line', line => {
   if (m.method === 'session/load') {
     const sessionId = m.params?.sessionId;
     const sessions = loadSessions();
+    if (process.env.SYNTHETIC_REBUILD === '1') {
+      replyError(m.id, 'Simulated lost session during process rebuild');
+      return;
+    }
     if (!sessionId || !sessions[sessionId]) {
       replyError(m.id, `Session ${sessionId} not found in profile ${account.accountId}`);
       return;
@@ -145,6 +149,25 @@ createInterface({ input: process.stdin }).on('line', line => {
   }
   if (m.method === 'session/prompt') {
     const sessionId = m.params?.sessionId;
+    if (!loadSessions()[sessionId]) {
+      replyError(m.id, 'Session not found');
+      return;
+    }
+    logInvocation({ mode: 'prompt', accountId: account.accountId });
+    if (m.params.prompt.some(part => part.text === 'hold')) {
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call', toolCallId: 'synthetic-task', title: 'run_command',
+            kind: 'execute', status: 'in_progress',
+            rawInput: { CommandLine: 'synthetic-test', toolSummary: 'Synthetic task' },
+          },
+        },
+      });
+    }
     send({
       jsonrpc: '2.0',
       method: 'session/update',

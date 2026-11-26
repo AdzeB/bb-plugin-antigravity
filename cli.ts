@@ -1,18 +1,13 @@
-import { accessSync, constants, statSync } from "node:fs";
+import { accessSync, constants, lstatSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, isAbsolute, join, parse, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { experimental_hostToolchain } from "@get-bb/plugin-sdk/process";
 import { experimental_buildProviderCliEnv, experimental_compareVersions, experimental_versionFrom, type ProviderHealthResult } from "@get-bb/plugin-sdk/provider-bridge";
 
-export const BB_ANTIGRAVITY_GEMINI_DIR_ENV = "BB_ANTIGRAVITY_GEMINI_DIR";
-export const BB_ANTIGRAVITY_APP_DATA_DIR_ENV = "BB_ANTIGRAVITY_APP_DATA_DIR";
-export const DEFAULT_ANTIGRAVITY_GEMINI_DIR = ".gemini";
-export const DEFAULT_ANTIGRAVITY_APP_DATA_DIR = "antigravity-cli";
-
-export type AntigravityProfileOverrides = {
-  geminiDir: string | null;
-  appDataDir: string | null;
-};
+const BB_ANTIGRAVITY_GEMINI_DIR_ENV = "BB_ANTIGRAVITY_GEMINI_DIR";
+const BB_ANTIGRAVITY_APP_DATA_DIR_ENV = "BB_ANTIGRAVITY_APP_DATA_DIR";
+const DEFAULT_ANTIGRAVITY_GEMINI_DIR = ".gemini";
+const DEFAULT_ANTIGRAVITY_APP_DATA_DIR = "antigravity-cli";
 
 const GEMINI_DIR_FLAGS = ["--gemini-dir", "--gemini_dir"] as const;
 const APP_DATA_DIR_FLAGS = ["--app-data-dir", "--app_data_dir"] as const;
@@ -23,7 +18,8 @@ function isFullyQualified(path: string | undefined): path is string {
 }
 
 function windowsEnvKey(env: NodeJS.ProcessEnv, name: string): string {
-  return Object.keys(env).find(key => key.toUpperCase() === name) ?? name;
+  // Node uses the first case-insensitive match in sorted key order on Windows.
+  return Object.keys(env).sort().find(key => key.toUpperCase() === name) ?? name;
 }
 
 export function hostHomeDirectory(): string | undefined {
@@ -88,101 +84,76 @@ export function resolveAntigravityCommand(command: string, options?: { cwd?: str
   }
 }
 
-function nonEmptyEnvValue(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function readEnvOverride(
-  hostEnv: Readonly<Record<string, unknown>>,
-  sessionEnvVars: unknown,
-  key: string,
-): string | null {
-  if (isPlainRecord(sessionEnvVars) && Object.hasOwn(sessionEnvVars, key)) {
-    return nonEmptyEnvValue(sessionEnvVars[key]);
+function readDirectoryFlag(args: string[], names: readonly string[]): { value: string; index: number; length: number } | undefined {
+  let found;
+  for (let i = 1; i < args.length; i++) {
+    if (args[i] === "--") break;
+    const flag = names.find(name => args[i] === name || args[i].startsWith(`${name}=`));
+    if (flag === undefined) continue;
+    if (found) throw new Error("Duplicate profile flag");
+    const length = args[i] === flag ? 2 : 1;
+    const value = length === 2 ? args[i + 1] : args[i].slice(flag.length + 1);
+    if (!value || value.startsWith("--") || value.includes("\0")) throw new Error("Invalid profile flag");
+    found = { value, index: i, length };
+    i += length - 1;
   }
-  return nonEmptyEnvValue(hostEnv[key]);
+  return found;
 }
 
-export function readAntigravityProfileOverrides(
-  hostEnv: Readonly<Record<string, unknown>>,
-  sessionEnvVars?: unknown,
-): AntigravityProfileOverrides {
-  return {
-    geminiDir: readEnvOverride(hostEnv, sessionEnvVars, BB_ANTIGRAVITY_GEMINI_DIR_ENV),
-    appDataDir: readEnvOverride(hostEnv, sessionEnvVars, BB_ANTIGRAVITY_APP_DATA_DIR_ENV),
-  };
+function realDirectoryPath(path: string): string {
+  try {
+    return realpathSync.native(path);
+  } catch (error) {
+    const parent = dirname(path);
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" || path === parent || !isDirectoryOrMissing(path)) throw error;
+    return join(realDirectoryPath(parent), basename(path));
+  }
 }
 
-function hasFlag(args: readonly unknown[], names: readonly string[]): boolean {
-  return args.some(arg => {
-    if (typeof arg !== "string") return false;
-    return names.some(name => arg === name || arg.startsWith(`${name}=`));
-  });
+function isDirectoryOrMissing(path: string): boolean {
+  try {
+    return lstatSync(path).isDirectory();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw error;
+  }
 }
 
-function readFlagValue(args: readonly unknown[] | undefined, names: readonly string[]): { present: boolean; value: string | null } {
-  if (!Array.isArray(args)) return { present: false, value: null };
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (typeof arg !== "string") continue;
-    for (const name of names) {
-      if (arg === name) {
-        return { present: true, value: nonEmptyEnvValue(args[i + 1]) };
-      }
-      if (arg.startsWith(`${name}=`)) {
-        return { present: true, value: nonEmptyEnvValue(arg.slice(name.length + 1)) };
-      }
+// undefined is the default profile; null means the requested profile cannot be bound safely.
+export function prepareAntigravityProfile(options: Record<string, any> | undefined): string[] | null | undefined {
+  const providerOptions = options?.providerOptions;
+  const spec = providerOptions?.acpLaunchSpec;
+  if (!Array.isArray(spec?.args) || spec.args[0] !== "acp") return undefined;
+  try {
+    const args: string[] = spec.args;
+    const geminiFlag = readDirectoryFlag(args, GEMINI_DIR_FLAGS);
+    const appDataFlag = readDirectoryFlag(args, APP_DATA_DIR_FLAGS);
+    if (providerOptions.profileRoutingEnabled !== true) {
+      return geminiFlag === undefined && appDataFlag === undefined ? undefined : null;
     }
-  }
-  return { present: false, value: null };
-}
+    const env = experimental_buildProviderCliEnv({ ...spec.env, ...options?.envVars });
+    const gemini = geminiFlag?.value ?? env[BB_ANTIGRAVITY_GEMINI_DIR_ENV]?.trim() ?? "";
+    const appData = appDataFlag?.value ?? env[BB_ANTIGRAVITY_APP_DATA_DIR_ENV]?.trim() ?? "";
+    if (!gemini && !appData) return undefined;
+    if (gemini.includes("\0") || appData.includes("\0") || args.includes("--")) return null;
 
-export function extractAntigravityProfileFromLaunchSpec(
-  spec: { args?: readonly unknown[] } | null | undefined,
-  hostEnv: Readonly<Record<string, unknown>>,
-  sessionEnvVars?: unknown,
-): AntigravityProfileOverrides {
-  const envOverrides = readAntigravityProfileOverrides(hostEnv, sessionEnvVars);
-  const geminiFlag = readFlagValue(spec?.args, GEMINI_DIR_FLAGS);
-  const appDataFlag = readFlagValue(spec?.args, APP_DATA_DIR_FLAGS);
-  return {
-    geminiDir: geminiFlag.present ? geminiFlag.value : envOverrides.geminiDir,
-    appDataDir: appDataFlag.present ? appDataFlag.value : envOverrides.appDataDir,
-  };
-}
-
-export function resolveAntigravityProfilePaths(
-  profile: AntigravityProfileOverrides,
-  hostEnv: NodeJS.ProcessEnv,
-): { geminiDir: string; appDataDir: string; effectiveAppDataDir: string } {
-  const homeKey = process.platform === "win32" ? windowsEnvKey(hostEnv, "USERPROFILE") : "HOME";
-  const envHome = hostEnv[homeKey] ?? (process.platform === "win32" ? hostEnv[windowsEnvKey(hostEnv, "HOME")] : undefined);
-  const baseHome = (isFullyQualified(envHome) ? envHome : undefined) ?? hostHomeDirectory() ?? "";
-  const geminiDir = profile.geminiDir !== null
-    ? resolve(baseHome, profile.geminiDir)
-    : join(baseHome, DEFAULT_ANTIGRAVITY_GEMINI_DIR);
-  const effectiveAppDataDir = profile.appDataDir ?? DEFAULT_ANTIGRAVITY_APP_DATA_DIR;
-  const appDataDir = resolve(geminiDir, effectiveAppDataDir);
-  return { geminiDir, appDataDir, effectiveAppDataDir };
-}
-
-function applyProfileFlags(spec: Record<string, any>, overrides: AntigravityProfileOverrides): void {
-  if (!Array.isArray(spec.args) || spec.args[0] !== "acp") return;
-  const extraArgs: string[] = [];
-  if (overrides.geminiDir !== null && !hasFlag(spec.args, GEMINI_DIR_FLAGS)) {
-    extraArgs.push("--gemini-dir", overrides.geminiDir);
-  }
-  if (overrides.appDataDir !== null && !hasFlag(spec.args, APP_DATA_DIR_FLAGS)) {
-    extraArgs.push("--app-data-dir", overrides.appDataDir);
-  }
-  if (extraArgs.length > 0) {
-    spec.args = [...spec.args, ...extraArgs];
+    const homeKey = process.platform === "win32" ? windowsEnvKey(env, "USERPROFILE") : "HOME";
+    const home = env[homeKey];
+    const geminiValue = gemini || DEFAULT_ANTIGRAVITY_GEMINI_DIR;
+    if (!isFullyQualified(geminiValue) && (isAbsolute(geminiValue) || parse(geminiValue).root || !isFullyQualified(home))) return null;
+    const geminiDir = realDirectoryPath(resolve(home ?? "", geminiValue));
+    const appDataValue = appData || DEFAULT_ANTIGRAVITY_APP_DATA_DIR;
+    if (!/^[a-z0-9_][a-z0-9_.-]*$/i.test(appDataValue) || appDataValue.endsWith(".")) return null;
+    const appDataDir = join(geminiDir, appDataValue);
+    // ACP accepts an app-data name under Gemini. Reject links that can redirect that name.
+    if (!isDirectoryOrMissing(appDataDir)) return null;
+    // The shared bridge keeps the original launch arguments in any replacement process.
+    // Pin Gemini to its resolved path so a changed alias cannot redirect a replacement.
+    args.splice(geminiFlag?.index ?? args.length, geminiFlag?.length ?? 0, "--gemini-dir", geminiDir);
+    if (appDataFlag === undefined && appData) args.push("--app-data-dir", appDataValue);
+    return [geminiDir, appDataValue];
+  } catch {
+    return null;
   }
 }
 
@@ -190,10 +161,10 @@ function applyProfileFlags(spec: Record<string, any>, overrides: AntigravityProf
 export function resolveAntigravityLaunchSpec(request: any): boolean {
   const params = request?.params;
   const targets = [
-    { options: params?.providerOptions, envVars: params?.envVars },
-    { options: params?.options?.providerOptions, envVars: params?.options?.envVars },
+    params?.providerOptions,
+    params?.options?.providerOptions,
   ];
-  for (const { options, envVars } of targets) {
+  for (const options of targets) {
     const spec = options?.acpLaunchSpec;
     if (!spec || typeof spec !== "object") continue;
     const env = experimental_buildProviderCliEnv(spec.env);
@@ -203,7 +174,6 @@ export function resolveAntigravityLaunchSpec(request: any): boolean {
       if (command === null) return false;
       spec.command = command;
     }
-    applyProfileFlags(spec, readAntigravityProfileOverrides(env, envVars));
   }
   return true;
 }

@@ -21,7 +21,7 @@ const sessionsRecordPath = join(root, 'started-sessions.json');
 process.env.BB_ANTIGRAVITY_TASK_STATE_DIR = stateDir;
 process.env.SYNTHETIC_AGY_LOG = invocationLog;
 
-const { experimental_providerBridge: bridge } = await import('../host.ts');
+const { backgroundTaskTracker, experimental_providerBridge: bridge } = await import('../host.ts');
 
 const originalWrite = process.stdout.write.bind(process.stdout);
 const messages = [];
@@ -77,7 +77,7 @@ function makeLaunchSpec({ pathDir = hostBin, extraHostEnv = {} } = {}) {
   };
 }
 
-function makeOptions(envVars, specOptions) {
+function makeOptions(envVars, specOptions, enabled = true) {
   return {
     permissionMode: 'accept-edits',
     permissionScope: 'workspace',
@@ -85,6 +85,7 @@ function makeOptions(envVars, specOptions) {
     permissionEscalation: 'ask',
     ...(envVars !== undefined ? { envVars } : {}),
     providerOptions: {
+      ...(enabled === null ? {} : { profileRoutingEnabled: enabled }),
       acpLaunchSpec: makeLaunchSpec(specOptions),
     },
   };
@@ -104,19 +105,28 @@ function extractTurnPayload(threadId, fromIndex) {
   return null;
 }
 
-async function runTurn(threadId, providerThreadId, clientRequestId, envVars) {
+async function runTurn(threadId, providerThreadId, clientRequestId, envVars, enabled = true) {
   const startIdx = messages.length;
   const reqId = send('turn/start', {
     threadId,
     providerThreadId,
     clientRequestId,
     input: [{ type: 'text', text: 'identify' }],
-    options: makeOptions(envVars),
+    options: makeOptions(envVars, undefined, enabled),
   });
   const response = await wait(m => m.id === reqId);
   assert.ok(!response.error, `turn/start failed: ${JSON.stringify(response)}`);
   await wait(() => extractTurnPayload(threadId, startIdx) !== null);
+  await wait(() => messages.slice(startIdx).some(m =>
+    m.method === 'thread/delta' && m.params.threadId === threadId && m.params.deltas.some(d => d.kind === 'turn.boundary')));
   return extractTurnPayload(threadId, startIdx);
+}
+
+async function rejectRoute(method, params) {
+  const before = readInvocations().length;
+  const id = send(method, params);
+  assert.match((await wait(m => m.id === id)).error?.message, /different profile/i);
+  assert.equal(readInvocations().length, before, 'profile rejection must happen before invoking agy');
 }
 
 const alphaEnv = {
@@ -177,9 +187,9 @@ try {
     });
     const startedAlpha = await wait(m => m.id === startAlphaId);
     const alphaSessionId = startedAlpha.result?.providerThreadId;
-    assert.ok(alphaSessionId, JSON.stringify(startedAlpha));
+    assert.match(alphaSessionId, /^antigravity-profile:/, JSON.stringify(startedAlpha));
     const alphaTurn1 = await runTurn('thread-alpha', alphaSessionId, 'creq_23456789aa', alphaEnv);
-    assert.deepEqual(alphaTurn1, { accountId: 'synthetic-alpha', sessionId: alphaSessionId, resumed: false });
+    assert.deepEqual(alphaTurn1, { accountId: 'synthetic-alpha', sessionId: 'session-synthetic-alpha-1', resumed: false });
 
     const startBetaId = send('thread/start', {
       threadId: 'thread-beta',
@@ -189,9 +199,29 @@ try {
     });
     const startedBeta = await wait(m => m.id === startBetaId);
     const betaSessionId = startedBeta.result?.providerThreadId;
-    assert.ok(betaSessionId, JSON.stringify(startedBeta));
+    assert.match(betaSessionId, /^antigravity-profile:/, JSON.stringify(startedBeta));
     const betaTurn1 = await runTurn('thread-beta', betaSessionId, 'creq_23456789ab', betaEnv);
-    assert.deepEqual(betaTurn1, { accountId: 'synthetic-beta', sessionId: betaSessionId, resumed: false });
+    assert.deepEqual(betaTurn1, { accountId: 'synthetic-beta', sessionId: 'session-synthetic-beta-1', resumed: false });
+
+    const failedStartId = send('thread/start', {
+      threadId: 'thread-default',
+      cwd: root,
+      instructionMode: 'append',
+      options: makeOptions({ BB_ANTIGRAVITY_GEMINI_DIR: join(root, 'uninitialized-profile') }),
+    });
+    assert.ok((await wait(m => m.id === failedStartId)).error);
+    const defaultStartId = send('thread/start', {
+      threadId: 'thread-default',
+      cwd: root,
+      instructionMode: 'append',
+      options: makeOptions(alphaEnv, { extraHostEnv: {
+        BB_ANTIGRAVITY_GEMINI_DIR: betaGeminiDir,
+        BB_ANTIGRAVITY_APP_DATA_DIR: betaAppDataDir,
+      } }, null),
+    });
+    const defaultSessionId = (await wait(m => m.id === defaultStartId)).result?.providerThreadId;
+    assert.equal(defaultSessionId, 'session-synthetic-default-1');
+    assert.equal((await runTurn('thread-default', defaultSessionId, 'creq_23456789af', alphaEnv, 'true')).accountId, 'synthetic-default');
 
     // Built-in provider/usage stays host-scoped and ignores routed request envVars
     const routedUsageId = send('provider/usage', {
@@ -206,10 +236,11 @@ try {
       [['Gemini 7d', 99], ['Claude/GPT 5h', 98]],
     );
 
-    // Host-configured dedicated profile env does scope the host's Usage row
+    // Quota ignores profile overrides from either source, even with routing enabled.
     const hostProfileUsageId = send('provider/usage', {
       providerId: 'antigravity-cli',
       providerOptions: {
+        profileRoutingEnabled: true,
         acpLaunchSpec: makeLaunchSpec({
           extraHostEnv: {
             BB_ANTIGRAVITY_GEMINI_DIR: alphaGeminiDir,
@@ -222,13 +253,21 @@ try {
     assert.equal(hostProfileUsageRes.result?.usage?.status, 'ok');
     assert.deepEqual(
       hostProfileUsageRes.result.usage.windows.map(w => [w.label, w.usedPercent]),
-      [['Gemini 7d', 20], ['Claude/GPT 5h', 15]],
+      [['Gemini 7d', 99], ['Claude/GPT 5h', 98]],
     );
 
     assert.equal(existsSync(untrustedFlag), false, 'untrusted session PATH executable must never run');
-    writeFileSync(sessionsRecordPath, JSON.stringify({ alphaSessionId, betaSessionId }));
+    writeFileSync(sessionsRecordPath, JSON.stringify({ alphaSessionId, betaSessionId, defaultSessionId }));
   } else if (mode === 'phase2-restart-and-resume') {
-    const { alphaSessionId, betaSessionId } = JSON.parse(readFileSync(sessionsRecordPath, 'utf8'));
+    const { alphaSessionId, betaSessionId, defaultSessionId } = JSON.parse(readFileSync(sessionsRecordPath, 'utf8'));
+    const alphaResume = {
+      threadId: 'thread-alpha', providerThreadId: alphaSessionId, cwd: root, instructionMode: 'append',
+      options: makeOptions(alphaEnv),
+    };
+    await rejectRoute('thread/resume', { ...alphaResume, options: makeOptions(alphaEnv, undefined, false) });
+    await rejectRoute('thread/resume', { ...alphaResume, providerThreadId: 'antigravity-profile:1:corrupt' });
+    await rejectRoute('thread/resume', { ...alphaResume, threadId: 'another-bb-thread' });
+    await rejectRoute('thread/resume', { ...alphaResume, threadId: 'thread-default', providerThreadId: defaultSessionId });
 
     // 1. Disappeared env contribution after host restart must fail visibly before opening default account
     const missingEnvResumeId = send('thread/resume', {
@@ -267,13 +306,29 @@ try {
     const resumedAlpha = await wait(m => m.id === resumeAlphaId);
     assert.equal(resumedAlpha.result?.providerThreadId, alphaSessionId, JSON.stringify(resumedAlpha));
     const alphaTurn2 = await runTurn('thread-alpha', alphaSessionId, 'creq_23456789ac', alphaEnv);
-    assert.deepEqual(alphaTurn2, { accountId: 'synthetic-alpha', sessionId: alphaSessionId, resumed: true });
+    assert.deepEqual(alphaTurn2, { accountId: 'synthetic-alpha', sessionId: 'session-synthetic-alpha-1', resumed: true });
+
+    // A changed non-profile env var forces the SDK to rebuild from saved launch arguments.
+    const rebuildEnv = { ...alphaEnv, SYNTHETIC_REBUILD: '1' };
+    const rebuilt = await runTurn('thread-alpha', alphaSessionId, 'creq_23456789ag', rebuildEnv);
+    assert.deepEqual(rebuilt, { accountId: 'synthetic-alpha', sessionId: 'session-synthetic-alpha-2', resumed: false });
+    const replaced = await wait(m => m.method === 'session/replaced' && m.params.threadId === 'thread-alpha');
+    const replacementId = replaced.params.providerThreadId;
+    assert.match(replacementId, /^antigravity-profile:/);
+    assert.notEqual(replacementId, alphaSessionId);
+    assert.equal(replaced.params.contextLost, true);
+    const staleTurnId = send('turn/start', {
+      ...alphaResume, clientRequestId: 'creq_23456789ak', input: [{ type: 'text', text: 'identify' }],
+      options: makeOptions(rebuildEnv),
+    });
+    assert.match((await wait(m => m.id === staleTurnId)).error?.message, /session was replaced/i);
+    assert.deepEqual(await runTurn('thread-alpha', replacementId, 'creq_23456789am', rebuildEnv), rebuilt);
 
     // 4. Mid-thread turn/start switching Profile A -> Profile B must also fail visibly before opening Profile B
     const invocationsBeforeDrift = readInvocations().length;
     const driftTurnId = send('turn/start', {
       threadId: 'thread-alpha',
-      providerThreadId: alphaSessionId,
+      providerThreadId: replacementId,
       clientRequestId: 'creq_23456789ae',
       input: [{ type: 'text', text: 'drift' }],
       options: makeOptions(betaEnv),
@@ -308,7 +363,29 @@ try {
     const resumedBeta = await wait(m => m.id === resumeBetaId);
     assert.equal(resumedBeta.result?.providerThreadId, betaSessionId, JSON.stringify(resumedBeta));
     const betaTurn2 = await runTurn('thread-beta', betaSessionId, 'creq_23456789ad', betaEnv);
-    assert.deepEqual(betaTurn2, { accountId: 'synthetic-beta', sessionId: betaSessionId, resumed: true });
+    assert.deepEqual(betaTurn2, { accountId: 'synthetic-beta', sessionId: 'session-synthetic-beta-1', resumed: true });
+
+    const defaultResumeId = send('thread/resume', {
+      ...alphaResume, threadId: 'thread-default', providerThreadId: defaultSessionId, options: makeOptions({}),
+    });
+    assert.equal((await wait(m => m.id === defaultResumeId)).result?.providerThreadId, defaultSessionId);
+
+    const turn = {
+      threadId: 'thread-beta', providerThreadId: betaSessionId, clientRequestId: 'creq_23456789ah',
+      input: [{ type: 'text', text: 'hold' }], options: makeOptions(betaEnv),
+    };
+    send('turn/start', turn);
+    await wait(() => backgroundTaskTracker.isHoldingTurn('thread-beta'));
+    const steer = { ...turn, expectedTurnId: 'turn-1', clientRequestId: 'creq_23456789aj', input: [{ type: 'text', text: 'continue' }] };
+    await rejectRoute('turn/steer', { ...steer, options: makeOptions(alphaEnv) });
+    await rejectRoute('turn/steer', { ...steer, options: makeOptions(betaEnv, undefined, false) });
+    assert.equal(backgroundTaskTracker.isHoldingTurn('thread-beta'), true);
+
+    const continuationStart = messages.length;
+    const steerId = send('turn/steer', steer);
+    assert.equal((await wait(m => m.id === steerId)).error, undefined);
+    await wait(() => extractTurnPayload('thread-beta', continuationStart));
+    assert.equal(extractTurnPayload('thread-beta', continuationStart).accountId, 'synthetic-beta');
 
     assert.equal(existsSync(untrustedFlag), false, 'untrusted session PATH executable must never run');
   } else {

@@ -1,6 +1,5 @@
 import { experimental_acpLaunchSpecSchema, experimental_acpProviderBridge } from "@get-bb/plugin-sdk/provider-bridge/acp";
 import {
-  experimental_buildProviderCliEnv,
   threadStartParamsSchema,
   threadResumeParamsSchema,
   turnStartParamsSchema,
@@ -12,12 +11,14 @@ import { modeControlOutput } from "./mode-controls.ts";
 import { mapPromptMode } from "./prompt-mode.ts";
 import { interceptSubagentApproval, isSubagentApprovalForDisabledThread, transformSubagentRequest } from "./subagents.ts";
 import { readAntigravityProviderUsage } from "./usage.ts";
-import { extractAntigravityProfileFromLaunchSpec, resolveAntigravityLaunchSpec } from "./cli.ts";
+import { prepareAntigravityProfile, resolveAntigravityLaunchSpec } from "./cli.ts";
 import {
+  ANTIGRAVITY_INVALID_PROFILE_MESSAGE,
   ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE,
-  createSessionProfileStore,
-  defaultProfileBindingsPath,
+  decodeProfileSessionId,
+  encodeProfileSessionId,
   hashAntigravityProfile,
+  matchesProfileSessionId,
 } from "./profile-bindings.ts";
 
 registerAntigravityAcpDialect();
@@ -100,39 +101,104 @@ function missingCliResponse(method: unknown) {
 let stdoutFilterInstalled = false;
 const autoApproveThreads = new Map<string, boolean>();
 const commandDescriptionsThreads = new Map<string, boolean>();
-const sessionProfileStore = createSessionProfileStore({
-  persistPath: defaultProfileBindingsPath(),
-});
-const pendingProfileBindings = new Map<string, { threadId: string; profileHash: string }>();
+type PendingIdentity = { threadId: string; profileHash?: string; stop?: true };
+type SessionIdentity = { profileHash?: string; sessionId: string };
+const pendingIdentities = new Map<string | number, PendingIdentity>();
+const activeIdentities = new Map<string, SessionIdentity>();
 
-function recordSessionProfileFromResponse(line: string): string {
-  if (pendingProfileBindings.size === 0) return line;
-  let message: any;
-  try { message = JSON.parse(line); } catch { return line; }
-  if (!message || typeof message !== "object" || message.jsonrpc !== "2.0") return line;
-  if (typeof message.id !== "string" && typeof message.id !== "number") return line;
-  const key = String(message.id);
-  const pending = pendingProfileBindings.get(key);
-  if (!pending) return line;
-  pendingProfileBindings.delete(key);
-  const providerThreadId = message.result?.providerThreadId;
-  if (typeof providerThreadId === "string" && providerThreadId.length > 0) {
-    sessionProfileStore.bind({
-      threadId: pending.threadId,
-      providerThreadId,
-      profileHash: pending.profileHash,
-    });
+function pendingIdentityForThread(threadId: string): PendingIdentity | undefined {
+  for (const pending of pendingIdentities.values()) {
+    if (pending.threadId === threadId) return pending;
   }
-  return line;
 }
 
-function resolveRequestProfileHash(record: Record<string, any>): string | null {
-  const options = record.params?.options;
-  const spec = options?.providerOptions?.acpLaunchSpec;
-  if (!spec || typeof spec !== "object") return null;
-  const hostEnv = experimental_buildProviderCliEnv(spec.env);
-  const profile = extractAntigravityProfileFromLaunchSpec(spec, hostEnv, options?.envVars);
-  return hashAntigravityProfile(profile, hostEnv);
+function profileError(message: string) {
+  return { code: -32000, message };
+}
+
+function wrapProfileSessionIds(line: string): string {
+  if (pendingIdentities.size === 0 && activeIdentities.size === 0) return line;
+  let message: any;
+  try { message = JSON.parse(line); } catch { return line; }
+  if (message?.jsonrpc !== "2.0") return line;
+
+  if (message.method === undefined) {
+    const pending = pendingIdentities.get(message.id);
+    if (!pending) return line;
+    pendingIdentities.delete(message.id);
+    const { threadId, profileHash, stop } = pending;
+    if (stop) {
+      if (message.result?.ok === true) activeIdentities.delete(threadId);
+      return line;
+    }
+    if (message.error) return line;
+    const sessionId = message.result?.providerThreadId;
+    if (typeof sessionId !== "string" || !sessionId) {
+      if (profileHash === undefined) return line;
+      return JSON.stringify({ jsonrpc: "2.0", id: message.id, error: profileError(ANTIGRAVITY_INVALID_PROFILE_MESSAGE) });
+    }
+    activeIdentities.set(threadId, { profileHash, sessionId });
+    if (profileHash === undefined) return line;
+    message.result.providerThreadId = encodeProfileSessionId(threadId, sessionId, profileHash);
+    return JSON.stringify(message);
+  }
+
+  const { threadId, providerThreadId } = message.params ?? {};
+  if (typeof threadId !== "string" || typeof providerThreadId !== "string") return line;
+  const active = activeIdentities.get(threadId);
+  const profileHash = active?.profileHash ?? pendingIdentityForThread(threadId)?.profileHash;
+  // BB persists this SDK notification when a process rebuild changes the native session ID.
+  if (message.method === "session/replaced" && active) active.sessionId = providerThreadId;
+  if (profileHash === undefined) return line;
+  message.params.providerThreadId = encodeProfileSessionId(threadId, providerThreadId, profileHash);
+  return JSON.stringify(message);
+}
+
+function guardProfileSession(request: Record<string, any> | null): string | undefined {
+  const params = request?.params;
+  const threadId = params?.threadId;
+  if (typeof threadId !== "string") return;
+  const method = request?.method;
+  const id = request?.jsonrpc === "2.0" && (typeof request.id === "string" || typeof request.id === "number")
+    ? request.id : undefined;
+  if (method === "thread/fork") return "Antigravity does not support forking threads.";
+
+  const sessionId = decodeProfileSessionId(params.providerThreadId);
+  if (method === "thread/stop" || method === "thread/discard") {
+    if (sessionId) params.providerThreadId = sessionId.sessionId;
+    // The SDK acknowledges discard without releasing its live session. Wait for stop.
+    if (method === "thread/stop" && id !== undefined) pendingIdentities.set(id, { threadId, stop: true });
+    return;
+  }
+  const startsSession = method === "thread/start" || method === "thread/resume";
+  if (!startsSession && method !== "turn/start" && method !== "turn/steer") return;
+
+  if (pendingIdentityForThread(threadId)) return "Antigravity is updating this session. Try again when it is ready.";
+  const profile = prepareAntigravityProfile(params.options);
+  if (sessionId === null || (sessionId && profile == null)) return ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE;
+  if (profile === null) return ANTIGRAVITY_INVALID_PROFILE_MESSAGE;
+  const profileHash = profile === undefined ? undefined : hashAntigravityProfile(profile);
+  const active = activeIdentities.get(threadId);
+  if (active && active.profileHash !== profileHash) return ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE;
+
+  if (method === "thread/start") {
+    if (active?.profileHash || sessionId !== undefined) return ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE;
+  } else if (sessionId) {
+    if (profileHash === undefined || !matchesProfileSessionId(threadId, sessionId, profileHash)) {
+      return ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE;
+    }
+    if (active && active.sessionId !== sessionId.sessionId) {
+      return "This Antigravity session was replaced. Retry with the current session.";
+    }
+    params.providerThreadId = sessionId.sessionId;
+  } else if (profileHash !== undefined) {
+    return ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE;
+  }
+
+  if (startsSession) {
+    if (id === undefined) return ANTIGRAVITY_INVALID_PROFILE_MESSAGE;
+    pendingIdentities.set(id, { threadId, profileHash });
+  }
 }
 
 export function rememberApprovalSetting(request: any) {
@@ -229,7 +295,7 @@ function ensureStdoutFilter() {
   const output = modeControlOutput(
     interceptApproval,
     line => backgroundTaskTracker.processStdoutLine(
-      applyThreadCommandDescriptions(recordSessionProfileFromResponse(line), commandDescriptionsThreads),
+      applyThreadCommandDescriptions(wrapProfileSessionIds(line), commandDescriptionsThreads),
     ),
   );
   output.on("data", chunk => write(chunk));
@@ -257,42 +323,14 @@ export const experimental_providerBridge = {
       return;
     }
 
-    if (request?.method === "thread/discard") {
-      sessionProfileStore.forget({
-        threadId: typeof request.params?.threadId === "string" ? request.params.threadId : undefined,
-        providerThreadId: typeof request.params?.providerThreadId === "string" ? request.params.providerThreadId : undefined,
-      });
-    } else if (
-      request &&
-      (request.method === "thread/start" || request.method === "thread/resume" || request.method === "turn/start")
-    ) {
-      const profileHash = resolveRequestProfileHash(request);
-      if (profileHash !== null) {
-        const id = typeof request.id === "string" || typeof request.id === "number" ? request.id : null;
-        const threadId = typeof request.params?.threadId === "string" ? request.params.threadId : undefined;
-        const providerThreadId = typeof request.params?.providerThreadId === "string"
-          ? request.params.providerThreadId
-          : undefined;
-        if (
-          (request.method === "thread/resume" || request.method === "turn/start") &&
-          sessionProfileStore.checkMismatch({ threadId, providerThreadId, profileHash })
-        ) {
-          if (request.jsonrpc === "2.0" && id !== null) {
-            process.stdout.write(`${JSON.stringify({
-              jsonrpc: "2.0",
-              id,
-              error: {
-                code: -32000,
-                message: ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE,
-              },
-            })}\n`);
-          }
-          return;
-        }
-        if ((request.method === "thread/start" || request.method === "thread/resume") && id !== null && threadId) {
-          pendingProfileBindings.set(String(id), { threadId, profileHash });
-        }
+    // A held steer becomes turn/start with the same session reference and execution options.
+    const profileRejection = guardProfileSession(request);
+    if (profileRejection) {
+      const id = request?.id;
+      if (request?.jsonrpc === "2.0" && (typeof id === "string" || typeof id === "number")) {
+        process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: profileError(profileRejection) })}\n`);
       }
+      return;
     }
 
     if (parsed !== null) line = JSON.stringify(parsed);

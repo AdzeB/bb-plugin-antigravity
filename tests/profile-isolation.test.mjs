@@ -78,6 +78,7 @@ async function runPhase(mode, root) {
     ['--experimental-strip-types', fixturePath, mode, root],
     {
       timeout: 20_000,
+      windowsHide: true,
       env: {
         ...process.env,
         PATH: mode === 'missing-host-agy' ? join(root, 'empty-host-bin') : join(root, 'host-bin'),
@@ -87,7 +88,7 @@ async function runPhase(mode, root) {
       },
     },
   );
-  assert.match(result.stdout, /verified/);
+  assert.match(result.stdout, /verified/, result.stderr);
 }
 
 test('unresolved host agy fails with an installation diagnostic and never uses session PATH', async () => {
@@ -99,13 +100,17 @@ test('unresolved host agy fails with an installation diagnostic and never uses s
   }
 });
 
-test('two synthetic profiles stay bound across host restart, reject profile mismatches before launch, and keep usage host-scoped', async () => {
-  const root = createSyntheticWorkspace();
-  try {
+for (const state of ['missing', 'corrupt']) {
+  test(`routing survives host restart with ${state} local binding state`, async t => {
+    const root = createSyntheticWorkspace();
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    // A directory at the old binding path prevents the prototype from writing the binding.
+    const oldBindingPath = join(root, 'state', 'session-profiles.json');
+    mkdirSync(oldBindingPath, { recursive: true });
     await runPhase('phase1-start', root);
+    rmSync(oldBindingPath, { recursive: true });
+    if (state === 'corrupt') writeFileSync(oldBindingPath, 'corrupt');
     rmSync(join(root, 'invocations.jsonl'), { force: true });
     await runPhase('phase2-restart-and-resume', root);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+  });
+}

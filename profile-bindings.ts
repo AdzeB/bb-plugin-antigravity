@@ -1,162 +1,39 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { hostHomeDirectory, resolveAntigravityProfilePaths, type AntigravityProfileOverrides } from "./cli.ts";
+import { createHash } from "node:crypto";
+
+const PROFILE_ID_PREFIX = "antigravity-profile:";
+const PROFILE_ID_VERSION = "1:";
 
 export const ANTIGRAVITY_PROFILE_MISMATCH_MESSAGE =
-  "Cannot resume Antigravity session on a different profile. Restore the original BB_ANTIGRAVITY_GEMINI_DIR / BB_ANTIGRAVITY_APP_DATA_DIR profile or start a new thread.";
+  "Cannot continue this Antigravity session on a different profile. Re-enable profile routing and restore the original profile, or start a new thread.";
 
-const MAX_PERSISTED_BINDINGS = 2_000;
+export const ANTIGRAVITY_INVALID_PROFILE_MESSAGE =
+  "Cannot bind this Antigravity session to a profile. Check the profile directory settings and try again.";
 
-export interface SessionProfileBinding {
-  threadId: string;
-  providerThreadId: string;
-  profileHash: string;
-  updatedAt: number;
+export function hashAntigravityProfile(profile: string[]): string {
+  return digest(profile);
 }
 
-interface PersistedSessionProfileState {
-  version: 1;
-  bindings: SessionProfileBinding[];
+function digest(values: string[]): string {
+  return createHash("sha256").update(JSON.stringify(values)).digest("hex");
 }
 
-export function defaultProfileBindingsPath(): string | undefined {
-  const override = process.env.BB_ANTIGRAVITY_TASK_STATE_DIR?.trim();
-  if (override) return join(override, "session-profiles.json");
-  const home = hostHomeDirectory();
-  return home === undefined ? undefined : join(home, ".bb", "plugin-data", "bb-plugin-antigravity", "session-profiles.json");
+export function encodeProfileSessionId(threadId: string, sessionId: string, profileHash: string): string {
+  return PROFILE_ID_PREFIX + PROFILE_ID_VERSION + digest([threadId, sessionId, profileHash]) + ":" + sessionId;
 }
 
-export function hashAntigravityProfile(
-  profile: AntigravityProfileOverrides,
-  hostEnv: NodeJS.ProcessEnv,
-): string {
-  const { appDataDir } = resolveAntigravityProfilePaths(profile, hostEnv);
-  const normalized = process.platform === "win32" ? appDataDir.toLowerCase() : appDataDir;
-  return createHash("sha256").update(normalized).digest("hex");
+// undefined is a legacy/default ID; null is a malformed or unsupported routing marker.
+export function decodeProfileSessionId(value: unknown): { binding: string; sessionId: string } | null | undefined {
+  if (typeof value !== "string" || !value.startsWith(PROFILE_ID_PREFIX)) return undefined;
+  const payload = value.slice(PROFILE_ID_PREFIX.length);
+  if (!payload.startsWith(PROFILE_ID_VERSION)) return null;
+  const match = /^([a-f0-9]{64}):([\s\S]+)$/.exec(payload.slice(PROFILE_ID_VERSION.length));
+  return match ? { binding: match[1], sessionId: match[2] } : null;
 }
 
-function isValidBinding(value: unknown): value is SessionProfileBinding {
-  if (!value || typeof value !== "object") return false;
-  const record = value as Record<string, unknown>;
-  return (
-    typeof record.threadId === "string" &&
-    record.threadId.length > 0 &&
-    typeof record.providerThreadId === "string" &&
-    record.providerThreadId.length > 0 &&
-    typeof record.profileHash === "string" &&
-    record.profileHash.length > 0 &&
-    typeof record.updatedAt === "number" &&
-    Number.isFinite(record.updatedAt)
-  );
-}
-
-function boundBindings(bindings: SessionProfileBinding[]): SessionProfileBinding[] {
-  return bindings
-    .slice()
-    .sort((a, b) => b.updatedAt - a.updatedAt)
-    .slice(0, MAX_PERSISTED_BINDINGS);
-}
-
-function readBindingsFile(persistPath: string): SessionProfileBinding[] {
-  try {
-    const raw = readFileSync(persistPath, "utf8");
-    const parsed = JSON.parse(raw) as Partial<PersistedSessionProfileState> | null;
-    if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.bindings)) return [];
-    return parsed.bindings.filter(isValidBinding);
-  } catch {
-    return [];
-  }
-}
-
-function writeBindingsFile(persistPath: string, bindings: SessionProfileBinding[]): void {
-  const payload = JSON.stringify({
-    version: 1,
-    bindings: boundBindings(bindings),
-  } satisfies PersistedSessionProfileState);
-  mkdirSync(dirname(persistPath), { recursive: true });
-  const tempPath = `${persistPath}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    writeFileSync(tempPath, payload, { mode: 0o600 });
-    renameSync(tempPath, persistPath);
-  } catch (error) {
-    try { rmSync(tempPath, { force: true }); } catch {}
-    try { writeFileSync(persistPath, payload, { mode: 0o600 }); } catch {
-      throw error;
-    }
-  }
-}
-
-export interface SessionProfileStore {
-  bind(entry: { threadId: string; providerThreadId: string; profileHash: string }): void;
-  find(ref: { threadId?: string; providerThreadId?: string }): SessionProfileBinding | null;
-  checkMismatch(ref: { threadId?: string; providerThreadId?: string; profileHash: string }): boolean;
-  forget(ref: { threadId?: string; providerThreadId?: string }): void;
-}
-
-export function createSessionProfileStore(options?: {
-  persistPath?: string;
-  now?: () => number;
-}): SessionProfileStore {
-  const persistPath = options && "persistPath" in options ? options.persistPath : defaultProfileBindingsPath();
-  const now = options?.now ?? (() => Date.now());
-  let memoryBindings: SessionProfileBinding[] = [];
-
-  const readAll = (): SessionProfileBinding[] =>
-    persistPath === undefined ? memoryBindings : readBindingsFile(persistPath);
-
-  const writeAll = (bindings: SessionProfileBinding[]): void => {
-    if (persistPath === undefined) {
-      memoryBindings = boundBindings(bindings);
-      return;
-    }
-    try {
-      writeBindingsFile(persistPath, bindings);
-    } catch {}
-  };
-
-  const find = (ref: { threadId?: string; providerThreadId?: string }): SessionProfileBinding | null => {
-    const bindings = readAll();
-    if (ref.providerThreadId) {
-      const bySession = bindings.find(entry => entry.providerThreadId === ref.providerThreadId);
-      if (bySession) return bySession;
-    }
-    if (ref.threadId) {
-      const byThread = bindings.find(entry => entry.threadId === ref.threadId);
-      if (byThread) return byThread;
-    }
-    return null;
-  };
-
-  return {
-    bind(entry) {
-      const bindings = readAll().filter(
-        existing =>
-          existing.providerThreadId !== entry.providerThreadId &&
-          existing.threadId !== entry.threadId,
-      );
-      bindings.push({
-        threadId: entry.threadId,
-        providerThreadId: entry.providerThreadId,
-        profileHash: entry.profileHash,
-        updatedAt: now(),
-      });
-      writeAll(bindings);
-    },
-    find,
-    checkMismatch(ref) {
-      const existing = find(ref);
-      return existing !== null && existing.profileHash !== ref.profileHash;
-    },
-    forget(ref) {
-      const bindings = readAll();
-      const next = bindings.filter(
-        existing =>
-          (ref.providerThreadId ? existing.providerThreadId !== ref.providerThreadId : true) &&
-          (ref.threadId ? existing.threadId !== ref.threadId : true),
-      );
-      if (next.length === bindings.length) return;
-      writeAll(next);
-    },
-  };
+export function matchesProfileSessionId(
+  threadId: string,
+  id: { binding: string; sessionId: string },
+  profileHash: string,
+): boolean {
+  return id.binding === digest([threadId, id.sessionId, profileHash]);
 }
